@@ -14,7 +14,6 @@ const net = require("node:net");
 const path = require("node:path");
 const process = require("node:process");
 const { spawn } = require("node:child_process");
-const { chromium, errors } = require("playwright");
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const BROWSER_HEADLESS = !["0", "false", "no"].includes(
@@ -31,6 +30,7 @@ const ORIGINAL_PUBLIC_IP_FILE = process.env.VPN_ORIGINAL_PUBLIC_IP_FILE
 const PROXY_KILL_SWITCH_CHAIN = "VPN_PROXY_KILLSWITCH";
 const PROXY_LISTEN_ADDRESS = "0.0.0.0";
 const PROXY_START_TIMEOUT_MILLISECONDS = 5000;
+const PUBLIC_IP_FAMILY = process.env.VPN_PUBLIC_IP_FAMILY || "4";
 const PUBLIC_IP_ENDPOINT = process.env.VPN_PUBLIC_IP_ENDPOINT
   || "https://ifconfig.io/ip";
 const RUNTIME_DIRECTORY = path.dirname(ORIGINAL_PUBLIC_IP_FILE);
@@ -61,6 +61,7 @@ const COLORS = {
 let activeOpenConnectProcess = null;
 const activeProxyProcesses = new Map();
 let proxyOperationPromise = Promise.resolve();
+let playwrightErrors = null;
 let shutdownRequested = false;
 let socksProxyGroupId = null;
 let socksProxyUserId = null;
@@ -277,6 +278,9 @@ function validateVpnServer() {
   if (serverUrl.protocol !== "https:") {
     throw new Error("VPN_SERVER must use HTTPS");
   }
+  if (!["4", "6"].includes(PUBLIC_IP_FAMILY)) {
+    throw new Error("VPN_PUBLIC_IP_FAMILY must be 4 or 6");
+  }
 }
 
 function normalizeTotpSecret(rawSecret) {
@@ -357,6 +361,7 @@ async function fetchPublicIp(proxyUrl = "", requestLabel = "direct") {
     "--show-error",
     "--max-time",
     "7",
+    PUBLIC_IP_FAMILY === "4" ? "--ipv4" : "--ipv6",
   ];
   if (proxyUrl) {
     curlArguments.push("--proxy", proxyUrl);
@@ -467,7 +472,7 @@ async function clickLocator(locator, actionName) {
   try {
     await locator.click({ timeout: 5000 });
   } catch (error) {
-    if (!(error instanceof errors.TimeoutError)) {
+    if (!playwrightErrors || !(error instanceof playwrightErrors.TimeoutError)) {
       throw error;
     }
     log("warn", "browser.control.retry", {
@@ -707,6 +712,8 @@ async function runBrowser(startUrl) {
     location: safeLocation(startUrl),
   });
   const credentials = readCredentials();
+  const { chromium, errors } = require("playwright");
+  playwrightErrors = errors;
   fs.mkdirSync(BROWSER_PROFILE_DIRECTORY, { mode: 0o700, recursive: true });
   const browserContext = await chromium.launchPersistentContext(
     BROWSER_PROFILE_DIRECTORY,
@@ -1161,9 +1168,6 @@ function readOriginalPublicIp() {
 }
 
 function assertVpnPublicIp(currentPublicIp, originalPublicIp, requestLabel) {
-  if (net.isIP(currentPublicIp) !== net.isIP(originalPublicIp)) {
-    throw new Error(`${requestLabel} egress changed address family from the pre-VPN baseline`);
-  }
   if (currentPublicIp === originalPublicIp) {
     throw new Error(`${requestLabel} egress returned the pre-VPN public IP`);
   }

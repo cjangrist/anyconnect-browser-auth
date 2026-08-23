@@ -264,7 +264,8 @@ the relevant service's `environment` list in a local Compose override.
 | `VPN_BROWSER_PROFILE_DIRECTORY` | `/tmp/vpn-browser-profile` | `vpn` | Chromium persistent-context directory. It persists across a restart of the same container, but not container replacement. |
 | `VPN_BROWSER_TIMEOUT_MILLISECONDS` | `180000` | `vpn` | Maximum time allowed for the external-browser authentication flow. |
 | `VPN_ORIGINAL_PUBLIC_IP_FILE` | `/run/vpn-sidecar/original-public-ip` | `vpn` | File holding the pre-VPN public IP inside the container. |
-| `VPN_PUBLIC_IP_ENDPOINT` | `https://ifconfig.io/ip` | `vpn` | HTTPS endpoint that must return one plain IPv4 or IPv6 address. |
+| `VPN_PUBLIC_IP_ENDPOINT` | `https://ifconfig.io/ip` | `vpn` | HTTPS endpoint that must return one plain IP address for the selected address family. |
+| `VPN_PUBLIC_IP_FAMILY` | `4` | `vpn` | Pins all baseline and health probes to IPv4 (`4`) or IPv6 (`6`). |
 | `VPN_TUNNEL_INTERFACE` | `tun0` | `vpn` | Interface whose presence proves that OpenConnect configured a tunnel. |
 | `VPN_WATCHDOG_FAILURE_THRESHOLD` | `3` | `vpn` | Consecutive failed healthchecks before the supervisor terminates OpenConnect. |
 | `VPN_WATCHDOG_INTERVAL_MILLISECONDS` | `30000` | `vpn` | Delay between internal watchdog checks. |
@@ -279,6 +280,7 @@ services:
     environment:
       - VPN_BROWSER_TIMEOUT_MILLISECONDS
       - VPN_PUBLIC_IP_ENDPOINT
+      - VPN_PUBLIC_IP_FAMILY
       - VPN_WATCHDOG_FAILURE_THRESHOLD
       - VPN_WATCHDOG_INTERVAL_MILLISECONDS
 
@@ -340,12 +342,12 @@ result later requires all of the following:
 2. The baseline file exists and contains a syntactically valid IP address.
 3. Concurrent direct, HTTP-proxy, and SOCKS5-proxy `curl` requests each succeed within
    seven seconds.
-4. The new response is a valid IP address.
-5. The new address differs from the pre-VPN baseline.
+4. The new response is a valid IP address in the configured address family.
+5. The new address differs from the pre-VPN baseline in that same address family.
 6. A hostname request through the HTTP proxy returns a valid public IP address that
-   differs from the pre-VPN baseline.
+   differs from the pre-VPN baseline in that same address family.
 7. A hostname request through the SOCKS5 proxy returns a valid public IP address that
-   differs from the pre-VPN baseline.
+   differs from the pre-VPN baseline in that same address family.
 
 This proves that the expected interface exists and that real application traffic has
 observable VPN egress, with both requested proxy endpoints available.
@@ -359,8 +361,11 @@ In that case this healthcheck will report unhealthy even though private routes w
 
 Use a controlled HTTPS endpoint whose response changes across the tunnel, or adapt the
 healthcheck to probe a private resource. Any replacement for
-`VPN_PUBLIC_IP_ENDPOINT` must return only one plain IP address because the current
-parser rejects HTML, JSON, and explanatory text.
+`VPN_PUBLIC_IP_ENDPOINT` must return only one plain IP address in the configured
+family because the current parser rejects HTML, JSON, and explanatory text. The default
+configuration generates up to 18 requests per minute (three watchdog probes every 30
+seconds and three Compose healthcheck probes every 15 seconds), so a replacement
+endpoint must tolerate that rate or the intervals must be increased together.
 
 ## Auto-healing and lifecycle behavior
 
