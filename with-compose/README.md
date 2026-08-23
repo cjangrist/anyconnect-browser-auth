@@ -1,4 +1,4 @@
-# Autonomous AnyConnect SAML + TOTP VPN sidecar
+# Autonomous AnyConnect SAML + TOTP VPN proxy
 
 This project runs an AnyConnect-compatible VPN entirely inside a Docker network
 namespace. It is designed for gateways that require a browser-based SAML sign-in,
@@ -7,8 +7,10 @@ The complete authentication and reconnection path is unattended: OpenConnect sta
 the SSO exchange, Playwright drives the identity-provider pages, the script generates
 the current RFC 6238 code, and OpenConnect establishes the tunnel.
 
-The host keeps its normal routes, DNS configuration, and public IP. Only containers
-that explicitly share the `vpn` service's network namespace use the tunnel.
+The host keeps its normal routes, DNS configuration, and public IP. Clients opt into
+the tunnel through the HTTP proxy on port `8080` or the SOCKS5 proxy on port `1080`.
+Compose publishes both ports on every host IPv4 interface (`0.0.0.0`) without proxy
+authentication.
 
 This is not a general-purpose replacement for every vendor VPN client or every MFA
 system. Read [Compatibility and limitations](#compatibility-and-limitations) before
@@ -31,8 +33,10 @@ This project keeps those responsibilities separated:
 - OpenConnect implements the VPN protocol, owns the loopback SSO callback, configures
   routes and DNS, and maintains the encrypted tunnel.
 - Playwright implements the browser session and login-page state machine.
-- `vpn.js` supervises both pieces, generates TOTP codes, sanitizes logs, checks real
-  egress, and reconnects when the tunnel stops working.
+- `vpn.js` supervises OpenConnect and both proxy daemons, generates TOTP codes,
+  sanitizes logs, checks real egress, and reconnects when the tunnel stops working.
+- Tinyproxy accepts HTTP proxy and HTTPS `CONNECT` traffic on port `8080`.
+- MicroSocks accepts SOCKS5 traffic on port `1080`.
 - Docker isolates all network changes from the host.
 
 No browser window, password prompt, TOTP prompt, cookie copy/paste step, or host VPN
@@ -42,41 +46,44 @@ installation is required during normal operation.
 
 ```mermaid
 flowchart LR
-    Host[Host network namespace] -->|Docker API| VPN
+    Client[Host or LAN client] -->|HTTP :8080| HTTPProxy
+    Client -->|SOCKS5 :1080| SOCKSProxy
 
     subgraph Namespace[VPN container network namespace]
         VPN[vpn service\nNode.js supervisor]
         OC[OpenConnect]
         Browser[Playwright Chromium]
         Tunnel[tun0]
-        Probe[through-vpn probe]
+        KillSwitch[UID-scoped firewall kill switch]
+        HTTPProxy[Tinyproxy]
+        SOCKSProxy[MicroSocks]
 
         VPN -->|starts and monitors| OC
+        VPN -->|starts after VPN proof| HTTPProxy
+        VPN -->|starts after VPN proof| SOCKSProxy
         OC -->|external-browser URL| Browser
         Browser -->|SSO redirects and TOTP| IdP[Identity provider]
         Browser -->|loopback callback| OC
         OC --> Tunnel
-        Probe -->|health check traffic| Tunnel
+        HTTPProxy --> KillSwitch
+        SOCKSProxy --> KillSwitch
+        KillSwitch --> Tunnel
     end
 
     Tunnel --> Gateway[AnyConnect-compatible gateway]
     Gateway --> Internet[VPN-routed destinations]
 ```
 
-The Compose stack contains two services built from the same image:
+The Compose stack contains one service and one container:
 
 | Service | Purpose |
 | --- | --- |
-| `vpn` | Runs `vpn.js connect`, OpenConnect, Chromium, the watchdog, and the `tun0` interface. It owns the network namespace. |
-| `through-vpn` | Shares `vpn`'s network namespace and continuously proves that the tunnel and public-IP invariant remain valid. It is also a minimal example of how an application can be routed through the VPN. |
+| `vpn` | Runs `vpn.js connect`, OpenConnect, Chromium, the watchdog, Tinyproxy, MicroSocks, and the `tun0` interface. |
 
-The `through-vpn` service uses `network_mode: service:vpn`. It therefore has no
-independent network stack: interfaces, routes, DNS, loopback, and public egress are the
-same in both containers.
-
-The named `vpn-runtime` volume stores the pre-VPN public IP. It is writable by `vpn`
-and read-only in `through-vpn`. It does not store the username, password, or TOTP
-secret.
+The supervisor records the pre-VPN public IP in the container's runtime directory.
+Proxy listeners are not started until `tun0` exists and the public egress address has
+changed. They are stopped immediately when tunnel health is lost and started again
+only after VPN egress recovers.
 
 ## End-to-end startup sequence
 
@@ -88,9 +95,11 @@ sequenceDiagram
     participant Browser as Playwright
     participant IdP as Identity provider
     participant Gateway as VPN gateway
+    participant Proxies as HTTP and SOCKS proxies
 
     Compose->>Supervisor: start connect mode
     Supervisor->>Supervisor: validate environment and HTTPS server URL
+    Supervisor->>Supervisor: install IPv4/IPv6 proxy UID kill-switch rules
     Supervisor->>Supervisor: record public IP before VPN
     Supervisor->>OC: start with --external-browser=/app/vpn.js
     OC->>Gateway: request AnyConnect authentication
@@ -105,9 +114,11 @@ sequenceDiagram
     OC->>Gateway: consume SSO result and establish tunnel
     Gateway-->>OC: routes, DNS, and tunnel parameters
     OC->>Supervisor: tun0 is available
-    Compose->>Supervisor: run healthcheck
     Supervisor->>Supervisor: verify public IP differs from baseline
-    Compose-->>Compose: mark vpn healthy, then start through-vpn
+    Supervisor->>Proxies: start listeners on 0.0.0.0:8080 and :1080
+    Compose->>Supervisor: run healthcheck
+    Supervisor->>Supervisor: verify VPN egress and both listeners
+    Compose-->>Compose: mark vpn healthy
 ```
 
 The browser code never extracts or forwards the VPN cookie itself. OpenConnect owns
@@ -187,22 +198,22 @@ The first build compiles the pinned OpenConnect source revision and downloads th
 Playwright base image and Node dependencies. It will take longer than subsequent
 cached builds.
 
-`--wait` returns only after both services are running and healthy. Normal startup may
-take tens of seconds because it includes browser authentication and tunnel setup. The
-`vpn` healthcheck has a 90-second Compose start period, while the internal browser
-deadline defaults to 180 seconds.
+`--wait` returns only after the container, tunnel, and both proxy listeners are
+healthy. Normal startup may take tens of seconds because it includes browser
+authentication and tunnel setup. The `vpn` healthcheck has a 90-second Compose start
+period, while the internal browser deadline defaults to 180 seconds.
 
 ### 4. Inspect status and sanitized logs
 
 ```bash
 docker compose ps
-docker compose logs --no-color vpn through-vpn
+docker compose logs --no-color vpn
 ```
 
 To follow reconnect activity:
 
 ```bash
-docker compose logs --follow --no-color vpn through-vpn
+docker compose logs --follow --no-color vpn
 ```
 
 The script redacts lines that look like cookies, tokens, session IDs, SAML requests,
@@ -210,6 +221,19 @@ or SSO callback paths. Credential values are removed from detected authenticatio
 errors, and email-like values in those errors are replaced. Logs still contain the VPN
 server and may contain non-secret identity-provider paths or page titles. Treat logs as
 sensitive operational data and review them before sharing.
+
+### 5. Use the proxies
+
+From the Docker host:
+
+```bash
+curl --proxy http://127.0.0.1:8080 https://ifconfig.io/ip
+curl --proxy socks5h://127.0.0.1:1080 https://ifconfig.io/ip
+```
+
+For another machine, replace `127.0.0.1` with the Docker host's reachable address.
+Compose binds both published ports to `0.0.0.0`; no username or password is required.
+The `socks5h` scheme performs DNS resolution through the SOCKS proxy.
 
 ## Configuration reference
 
@@ -219,7 +243,7 @@ These are the variables declared by `compose.yaml` and represented in `.env.samp
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `COMPOSE_PROJECT_NAME` | Recommended | Compose directory name | Stable prefix for containers, images, networks, and the named volume. It is consumed by Compose and is not injected into the container. |
+| `COMPOSE_PROJECT_NAME` | Recommended | Compose directory name | Stable prefix for the container, image, and network. It is consumed by Compose and is not injected into the container. |
 | `VPN_SERVER` | Yes | None | HTTPS URL of the AnyConnect-compatible gateway. A group/path may be included if the gateway requires one. Non-HTTPS URLs are rejected. |
 | `VPN_USERNAME` | Yes | None | Username or email entered into the identity-provider form. |
 | `VPN_PASSWORD` | Yes | None | Password entered into the identity-provider form. |
@@ -239,9 +263,9 @@ the relevant service's `environment` list in a local Compose override.
 | --- | --- | --- | --- |
 | `VPN_BROWSER_PROFILE_DIRECTORY` | `/tmp/vpn-browser-profile` | `vpn` | Chromium persistent-context directory. It persists across a restart of the same container, but not container replacement. |
 | `VPN_BROWSER_TIMEOUT_MILLISECONDS` | `180000` | `vpn` | Maximum time allowed for the external-browser authentication flow. |
-| `VPN_ORIGINAL_PUBLIC_IP_FILE` | `/run/vpn-sidecar/original-public-ip` | Both | Baseline IP file. Both services must use the same value, and the path must be on a shared volume. |
-| `VPN_PUBLIC_IP_ENDPOINT` | `https://ifconfig.io/ip` | Both | HTTPS endpoint that must return one plain IPv4 or IPv6 address. Both services must use the same value. |
-| `VPN_TUNNEL_INTERFACE` | `tun0` | Both | Interface whose presence proves that OpenConnect configured a tunnel. |
+| `VPN_ORIGINAL_PUBLIC_IP_FILE` | `/run/vpn-sidecar/original-public-ip` | `vpn` | File holding the pre-VPN public IP inside the container. |
+| `VPN_PUBLIC_IP_ENDPOINT` | `https://ifconfig.io/ip` | `vpn` | HTTPS endpoint that must return one plain IPv4 or IPv6 address. |
+| `VPN_TUNNEL_INTERFACE` | `tun0` | `vpn` | Interface whose presence proves that OpenConnect configured a tunnel. |
 | `VPN_WATCHDOG_FAILURE_THRESHOLD` | `3` | `vpn` | Consecutive failed healthchecks before the supervisor terminates OpenConnect. |
 | `VPN_WATCHDOG_INTERVAL_MILLISECONDS` | `30000` | `vpn` | Delay between internal watchdog checks. |
 | `VPN_WATCHDOG_STARTUP_GRACE_MILLISECONDS` | Browser timeout plus 30 seconds | `vpn` | Grace period before absence of the initial tunnel counts as a watchdog failure. |
@@ -258,14 +282,9 @@ services:
       - VPN_WATCHDOG_FAILURE_THRESHOLD
       - VPN_WATCHDOG_INTERVAL_MILLISECONDS
 
-  through-vpn:
-    environment:
-      - VPN_PUBLIC_IP_ENDPOINT
 ```
 
-Then add the corresponding values to the private `.env`. Any variable that affects
-the healthcheck's file, endpoint, or interface must be passed consistently to both
-services.
+Then add the corresponding values to the private `.env`.
 
 ## Authentication state machine
 
@@ -287,7 +306,8 @@ The implemented actions are:
 
 The state machine records its last action so that a static page is not clicked or
 submitted repeatedly. It waits briefly after navigation-triggering actions, observes
-the newest tab, and logs only when the page title or sanitized location changes.
+the newest tab, retries transient click timeouts against a freshly resolved DOM, and
+logs only when the page title or sanitized location changes.
 
 ### TOTP behavior
 
@@ -313,7 +333,7 @@ The healthcheck is deliberately stronger than “the OpenConnect process exists.
 process can remain alive while routes, DNS, or the tunnel are unusable.
 
 At supervisor startup, before OpenConnect is launched, the script requests
-`VPN_PUBLIC_IP_ENDPOINT` and writes the result to the shared baseline file. A healthy
+`VPN_PUBLIC_IP_ENDPOINT` and writes the result to the runtime baseline file. A healthy
 result later requires all of the following:
 
 1. `VPN_TUNNEL_INTERFACE` exists under `/sys/class/net`.
@@ -321,9 +341,11 @@ result later requires all of the following:
 3. A new `curl` request succeeds within seven seconds.
 4. The new response is a valid IP address.
 5. The new address differs from the pre-VPN baseline.
+6. The HTTP proxy returns a valid HTTP response to its internal status request.
+7. The SOCKS5 proxy accepts the no-authentication method in a SOCKS5 handshake.
 
 This proves that the expected interface exists and that real application traffic has
-observable VPN egress. Both Compose healthchecks call the same implementation.
+observable VPN egress, with both requested proxy endpoints available.
 
 ### Split-tunnel caveat
 
@@ -354,64 +376,66 @@ outer loop waits five seconds, starts a new OpenConnect process, and completes S
 again. Browser authentication therefore also recovers from expired or irrecoverable
 sessions.
 
+The proxy processes start only after the first successful tunnel check. Any failed
+tunnel check stops both proxies immediately, before the watchdog waits for its failure
+threshold. This makes reconnects fail closed instead of allowing proxy traffic to
+fall back to the container's pre-VPN route.
+
+A kernel firewall provides the independent data-plane kill switch. Output owned by
+the `tinyproxy` or `nobody` UID may create traffic only through `tun0`. The only
+non-tunnel exception is established response traffic whose source port is the HTTP or
+SOCKS listener, which allows replies to clients. Equivalent IPv4 and IPv6 rules are
+installed before OpenConnect or either proxy starts. Even if a proxy process outlives
+the tunnel briefly, its direct `eth0` egress is rejected by the kernel.
+
 Only the OpenConnect child is replaced during this path; PID 1 remains alive. This was
 tested by terminating the OpenConnect child, observing a different replacement PID,
-and confirming that `tun0` and both service healthchecks recovered.
+and confirming that `tun0`, both proxy processes, and the container healthcheck
+recovered.
 
 ### 3. Docker restart policies
 
-Both services use `restart: unless-stopped`. Docker restarts them after an unexpected
-container exit or daemon restart, unless an operator explicitly stopped them.
+The service uses `restart: unless-stopped`. Docker restarts it after an unexpected
+container exit or daemon restart, unless an operator explicitly stopped it.
 
-`tini` is PID 1 in both containers. It forwards shutdown signals and reaps child
-processes. On `SIGINT` or `SIGTERM`, `vpn.js` marks shutdown as requested and terminates
-the active OpenConnect child instead of scheduling another reconnect.
+`tini` is PID 1 in the container. It forwards shutdown signals and reaps child
+processes. On `SIGINT` or `SIGTERM`, `vpn.js` marks shutdown as requested, stops both
+proxies, and terminates the active OpenConnect child instead of scheduling another
+reconnect.
 
 The Chromium profile lives in the writable layer at `/tmp/vpn-browser-profile` by
 default. A `docker compose restart` retains it and can present a remembered-account
 tile. Recreating the container discards it, but fresh username/password/TOTP
 authentication remains autonomous.
 
-## Routing another application through the VPN
+## Connecting applications
 
-Use the same network-namespace pattern as `through-vpn`:
-
-```yaml
-services:
-  application:
-    image: your-application-image
-    network_mode: service:vpn
-    depends_on:
-      vpn:
-        condition: service_healthy
-        restart: true
-```
-
-The application will see `tun0`, the VPN routes, and the same DNS configuration as
-`vpn`. It does not need `NET_ADMIN` or `/dev/net/tun` itself.
-
-Because the application has no independent network namespace, publish any application
-ports on the `vpn` service, not on the application service. All containers sharing the
-namespace also share loopback and the port space, so avoid port collisions.
-
-Do not use `network_mode: host`; that would defeat the main isolation property and
-allow the VPN client to modify host networking.
+Configure applications for either `http://DOCKER_HOST:8080` or
+`socks5h://DOCKER_HOST:1080`. Use `127.0.0.1` as `DOCKER_HOST` for applications on the
+Docker host. Applications on other machines use a reachable host address. Both
+listeners accept connections without authentication.
 
 ## Security model
 
 ### Network isolation
 
-The `vpn` container receives only the capability required to configure its own
-network namespace:
+The `vpn` container receives only the capabilities required to configure its network
+namespace and drop proxy privileges:
 
 - All Linux capabilities are dropped.
-- `NET_ADMIN` is added back.
+- `KILL` is added so the supervisor can stop proxy children after they drop to the
+  `tinyproxy` and `nobody` users.
+- `NET_ADMIN` is added back for `tun0`, routes, DNS, and firewall rules.
+- `SETUID` and `SETGID` are added so Tinyproxy and MicroSocks can run as the
+  unprivileged `tinyproxy` and `nobody` users after binding their ports.
 - `/dev/net/tun` is passed explicitly.
 - No host network mode is used.
-- No ports are published by default.
+- Only TCP ports `8080` and `1080` are published, both on `0.0.0.0`.
 
-OpenConnect's route and DNS changes therefore affect the shared container namespace,
-not the host namespace.
+OpenConnect's route, DNS, and firewall changes therefore affect the container
+namespace, not the host namespace. UID-scoped IPv4/IPv6 rules reject direct proxy
+egress outside `tun0`. Because proxy authentication is intentionally disabled, any
+client that can reach either published port can use the VPN egress while it is up.
 
 ### Credential handling
 
@@ -474,7 +498,8 @@ can be audited and reproduced.
 ### Runtime stage
 
 The final stage uses `mcr.microsoft.com/playwright:v1.62.0-noble`, adds OpenConnect's
-runtime libraries, `curl`, `iproute2`, `tini`, and `vpnc-scripts`, then installs:
+runtime libraries, `curl`, `iproute2`, `iptables`, `tini`, `tinyproxy`, `microsocks`, and
+`vpnc-scripts`, then installs:
 
 - Playwright `1.62.0` from the lockfile for the embedded authentication browser.
 - agent-browser `0.34.0` for contained browser diagnostics and egress verification.
@@ -492,8 +517,8 @@ contemporary Linux AnyConnect identity to gateways that branch on client metadat
 
 | Invocation | Behavior |
 | --- | --- |
-| `/app/vpn.js connect` | Default mode. Capture baseline IP, run OpenConnect, monitor health, and reconnect forever. |
-| `/app/vpn.js healthcheck` | Require the tunnel interface and a public IP different from the baseline. Exit nonzero on failure. |
+| `/app/vpn.js connect` | Default mode. Capture baseline IP, run OpenConnect, start/stop the proxies with tunnel health, and reconnect forever. |
+| `/app/vpn.js healthcheck` | Require the tunnel interface, changed public IP, and both proxy listeners. Exit nonzero on failure. |
 | `/app/vpn.js probe` | Run the healthcheck every 30 seconds forever and log healthy/unhealthy transitions. |
 | `/app/vpn.js self-test` | Verify required credential variables, RFC 6238 generation, configured TOTP decoding, and public-IP access. |
 | `/app/vpn.js https://...` | External-browser mode invoked by OpenConnect. Launch Chromium and drive authentication for the supplied URL. |
@@ -507,13 +532,12 @@ normally use only the first four modes.
 
 ```bash
 docker compose exec -T vpn /app/vpn.js healthcheck
-docker compose exec -T through-vpn /app/vpn.js healthcheck
 ```
 
-Expected output from each command:
+Expected output:
 
 ```text
-healthy: public IP differs from the pre-VPN public IP
+healthy: VPN egress and HTTP/SOCKS proxy listeners are available
 ```
 
 ### TOTP and environment self-test
@@ -530,16 +554,16 @@ self-test passed: environment credentials, RFC 6238 TOTP, and curl verified
 
 The test never prints the generated code or configured seed.
 
-### Confirm the interface and network namespace
+### Confirm the interface and proxy listeners
 
 ```bash
 docker compose exec -T vpn ip link show tun0
-docker compose exec -T through-vpn ip link show tun0
-docker compose exec -T vpn readlink /proc/1/ns/net
-docker compose exec -T through-vpn readlink /proc/1/ns/net
+docker compose exec -T vpn ss -ltnp
+docker compose port vpn 8080
+docker compose port vpn 1080
 ```
 
-Both namespace links should be identical.
+The listeners and both published mappings should report `0.0.0.0`.
 
 ### Compare host and VPN egress
 
@@ -553,6 +577,23 @@ docker compose exec -T vpn \
 ```
 
 The two IP addresses must differ under the default full-tunnel health model.
+
+### Verify HTTP and SOCKS5 proxy egress
+
+```bash
+printf 'http:  '
+curl --fail --silent --show-error --max-time 15 \
+  --proxy http://127.0.0.1:8080 https://ifconfig.io/ip
+
+printf 'socks: '
+curl --fail --silent --show-error --max-time 15 \
+  --proxy socks5h://127.0.0.1:1080 https://ifconfig.io/ip
+```
+
+Both addresses must differ from the host address. Some VPN gateways use a pool of NAT
+addresses, so separate proxy and container requests can legitimately return different
+VPN addresses. For a deterministic data-plane proof, confirm that each proxy UID's
+`tun0` firewall counter increases while its direct `eth0` attempt is rejected.
 
 ### Verify Chromium egress with agent-browser
 
@@ -600,7 +641,6 @@ docker compose exec -T vpn sh -lc '
 
 docker compose up -d --wait --wait-timeout 240
 docker compose exec -T vpn /app/vpn.js healthcheck
-docker compose exec -T through-vpn /app/vpn.js healthcheck
 ```
 
 The logs should contain `openconnect.start.exit`,
@@ -610,11 +650,11 @@ callback, and restored healthy checks.
 ### Exercise full-container restart
 
 ```bash
-docker compose restart --timeout 30 vpn through-vpn
+docker compose restart --timeout 30 vpn
 docker compose up -d --wait --wait-timeout 240
 ```
 
-This preserves the existing containers and therefore the default Chromium profile.
+This preserves the existing container and therefore the default Chromium profile.
 The login may select the remembered account before generating a new TOTP code.
 
 ## Troubleshooting
@@ -712,10 +752,12 @@ The base stack does not attach a display. Return `VPN_BROWSER_HEADLESS` to `true
 provide a dedicated X server/virtual display for debugging. Do not mount a personal
 host browser profile into the container.
 
-### Application ports are unreachable
+### Proxy ports are unreachable
 
-An application using `network_mode: service:vpn` cannot publish ports on its own
-service. Add the port mapping to `vpn`; both processes share the same port space.
+The proxy daemons are deliberately absent until the tunnel passes its public-IP
+health check. Run `docker compose ps` and `/app/vpn.js healthcheck` first. Once healthy,
+`docker compose port vpn 8080` and `docker compose port vpn 1080` should both report
+`0.0.0.0`. Check host firewall policy if local connections work but remote ones do not.
 
 ## Approaches evaluated during development
 
@@ -736,6 +778,15 @@ This is simpler and should be preferred when a gateway offers a scriptable form.
 does not solve a gateway that requires `single-sign-on-external-browser`. OpenConnect
 can suppress external authentication with `--no-external-auth` for gateways that
 offer a fallback, but that is not useful when SSO is mandatory.
+
+### OpenConnect proxy options
+
+OpenConnect's `--proxy` option configures an upstream HTTP or SOCKS proxy used to
+reach the VPN gateway; it does not create a listener for client applications.
+OpenConnect can pass packets to a separate userspace TCP stack with `--script-tun`,
+and projects such as `ocproxy` can expose SOCKS that way, but that replaces the normal
+kernel tunnel and still does not provide both requested protocols. The current design
+keeps the tested `tun0` path and attaches Tinyproxy and MicroSocks to it.
 
 ### `openconnect-sso` with QtWebEngine
 
@@ -810,15 +861,22 @@ Before publishing a change, verify:
 3. A no-cache image build succeeds.
 4. `/app/vpn.js self-test` passes inside the built image.
 5. A fresh container completes browser SSO without a pre-existing profile.
-6. `tun0` appears in both services.
-7. Both manual healthchecks pass.
-8. Host and container public IPs differ under the full-tunnel model.
-9. The contained Chromium egress test matches container `curl` egress.
-10. Restarting the same containers reauthenticates and returns to healthy.
-11. Terminating only the OpenConnect child produces a new PID and recovers both checks.
-12. Complete container logs contain no username, password, TOTP seed, rejection, or
+6. `tun0` appears in the container.
+7. The manual healthcheck passes and both proxy listeners are present.
+8. Ports `8080` and `1080` are published on `0.0.0.0`.
+9. IPv4 and IPv6 UID-scoped kill-switch chains are installed.
+10. Proxy-owned attempts through `eth0` are rejected while client replies still work.
+11. Host and container public IPs differ under the full-tunnel model.
+12. HTTP and SOCKS5 proxy egress both differ from host egress, and their proxy-UID
+    `tun0` counters increase.
+13. The contained Chromium egress test differs from host egress and increases the
+    selected proxy UID's `tun0` counter.
+14. Restarting the container reauthenticates and returns to healthy.
+15. Terminating only the OpenConnect child stops both proxies, produces a new PID,
+    and recovers the tunnel and listeners.
+16. Complete container logs contain no username, password, TOTP seed, rejection, or
     unexpected fatal event.
-13. `.env`, login files, local research, and temporary artifacts remain excluded from
+17. `.env`, login files, local research, and temporary artifacts remain excluded from
     Git and the Docker build context.
 
 ### Updating OpenConnect
@@ -847,24 +905,16 @@ requirements.
 
 ## Stopping and removing the stack
 
-Stop and remove service containers and the project network while retaining the
-baseline volume:
+Stop and remove the service container and project network:
 
 ```bash
 docker compose down
 ```
 
-To stop without removing containers:
+To stop without removing the container:
 
 ```bash
 docker compose stop
-```
-
-The named volume contains only runtime baseline state and is safe to recreate. If you
-intentionally want to remove it too:
-
-```bash
-docker compose down --volumes
 ```
 
 The next start captures a new baseline automatically.

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 /*
- * Autonomous AnyConnect VPN sidecar. OpenConnect owns Cisco's encrypted SSO
- * callback while Playwright supplies credentials and RFC 6238 MFA.
+ * Autonomous AnyConnect VPN proxy. OpenConnect owns Cisco's encrypted SSO
+ * callback, Playwright supplies credentials and MFA, and UID-scoped firewall
+ * rules keep the supervised HTTP and SOCKS proxies fail-closed.
  */
 
 "use strict";
@@ -13,7 +14,7 @@ const net = require("node:net");
 const path = require("node:path");
 const process = require("node:process");
 const { spawn } = require("node:child_process");
-const { chromium } = require("playwright");
+const { chromium, errors } = require("playwright");
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const BROWSER_HEADLESS = !["0", "false", "no"].includes(
@@ -24,11 +25,17 @@ const BROWSER_PROFILE_DIRECTORY = process.env.VPN_BROWSER_PROFILE_DIRECTORY
 const BROWSER_TIMEOUT_MILLISECONDS = Number(
   process.env.VPN_BROWSER_TIMEOUT_MILLISECONDS || 180000,
 );
+const HTTP_PROXY_PORT = 8080;
 const ORIGINAL_PUBLIC_IP_FILE = process.env.VPN_ORIGINAL_PUBLIC_IP_FILE
   || "/run/vpn-sidecar/original-public-ip";
+const PROXY_KILL_SWITCH_CHAIN = "VPN_PROXY_KILLSWITCH";
+const PROXY_LISTEN_ADDRESS = "0.0.0.0";
+const PROXY_START_TIMEOUT_MILLISECONDS = 5000;
 const PUBLIC_IP_ENDPOINT = process.env.VPN_PUBLIC_IP_ENDPOINT
   || "https://ifconfig.io/ip";
 const RUNTIME_DIRECTORY = path.dirname(ORIGINAL_PUBLIC_IP_FILE);
+const SOCKS_PROXY_PORT = 1080;
+const SOCKS_PROXY_USER_ID = 65534;
 const TUNNEL_INTERFACE = process.env.VPN_TUNNEL_INTERFACE || "tun0";
 const VPN_SERVER = process.env.VPN_SERVER || "";
 const WATCHDOG_FAILURE_THRESHOLD = Number(
@@ -51,6 +58,8 @@ const COLORS = {
 };
 
 let activeOpenConnectProcess = null;
+const activeProxyProcesses = new Map();
+let proxyOperationPromise = Promise.resolve();
 let shutdownRequested = false;
 
 function log(level, event, details = {}) {
@@ -62,6 +71,122 @@ function log(level, event, details = {}) {
   process.stderr.write(
     `${color}${new Date().toISOString()} ${level.toUpperCase()} ${event}${suffix}${COLORS.reset}\n`,
   );
+}
+
+function runCommand(command, argumentsList) {
+  return new Promise((resolve, reject) => {
+    const commandProcess = spawn(command, argumentsList, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    commandProcess.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    commandProcess.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    commandProcess.once("error", reject);
+    commandProcess.once("exit", (code) => {
+      resolve({
+        code,
+        stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
+        stdout: Buffer.concat(stdoutChunks).toString("utf8").trim(),
+      });
+    });
+  });
+}
+
+function isProcessRunning(childProcess) {
+  return Boolean(childProcess.pid)
+    && childProcess.exitCode === null
+    && childProcess.signalCode === null;
+}
+
+async function requireCommandSuccess(command, argumentsList, acceptedExitCodes = [0]) {
+  const result = await runCommand(command, argumentsList);
+  if (!acceptedExitCodes.includes(result.code)) {
+    throw new Error(
+      `${command} failed with code ${result.code}: ${result.stderr || "no error output"}`,
+    );
+  }
+  return result;
+}
+
+async function resolveSystemUserId(username) {
+  const result = await requireCommandSuccess("id", ["-u", username]);
+  const userId = Number(result.stdout);
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    throw new Error(`System user ${username} has an invalid user ID`);
+  }
+  return userId;
+}
+
+async function ensureFirewallOutputJump(command, userId) {
+  const jumpArguments = [
+    "OUTPUT",
+    "-m",
+    "owner",
+    "--uid-owner",
+    String(userId),
+    "-j",
+    PROXY_KILL_SWITCH_CHAIN,
+  ];
+  const checkResult = await requireCommandSuccess(
+    command,
+    ["-w", "5", "-C", ...jumpArguments],
+    [0, 1],
+  );
+  if (checkResult.code === 1) {
+    await requireCommandSuccess(command, ["-w", "5", "-I", ...jumpArguments]);
+  }
+}
+
+async function configureFirewallFamily(command, proxyPolicies) {
+  await requireCommandSuccess(
+    command,
+    ["-w", "5", "-N", PROXY_KILL_SWITCH_CHAIN],
+    [0, 1],
+  );
+  await requireCommandSuccess(command, ["-w", "5", "-F", PROXY_KILL_SWITCH_CHAIN]);
+  for (const policy of proxyPolicies) {
+    const ownerArguments = ["-m", "owner", "--uid-owner", String(policy.userId)];
+    await requireCommandSuccess(command, [
+      "-w", "5", "-A", PROXY_KILL_SWITCH_CHAIN,
+      ...ownerArguments,
+      "-p", "tcp", "--sport", String(policy.listenPort),
+      "-m", "conntrack", "--ctstate", "ESTABLISHED",
+      "-j", "ACCEPT",
+    ]);
+    await requireCommandSuccess(command, [
+      "-w", "5", "-A", PROXY_KILL_SWITCH_CHAIN,
+      ...ownerArguments,
+      "-o", TUNNEL_INTERFACE,
+      "-j", "ACCEPT",
+    ]);
+    await requireCommandSuccess(command, [
+      "-w", "5", "-A", PROXY_KILL_SWITCH_CHAIN,
+      ...ownerArguments,
+      "-j", "REJECT",
+    ]);
+    await ensureFirewallOutputJump(command, policy.userId);
+  }
+}
+
+async function configureProxyKillSwitch() {
+  log("info", "kill_switch.configure.enter", { interface: TUNNEL_INTERFACE });
+  const httpProxyUserId = await resolveSystemUserId("tinyproxy");
+  const proxyPolicies = [
+    { listenPort: HTTP_PROXY_PORT, userId: httpProxyUserId },
+    { listenPort: SOCKS_PROXY_PORT, userId: SOCKS_PROXY_USER_ID },
+  ];
+  await configureFirewallFamily("iptables", proxyPolicies);
+  const ipv6IsEnabled = fs.existsSync("/proc/net/if_inet6")
+    && fs.readFileSync("/proc/net/if_inet6", "utf8").trim();
+  if (ipv6IsEnabled) {
+    await configureFirewallFamily("ip6tables", proxyPolicies);
+  }
+  log("info", "kill_switch.configure.exit", {
+    httpProxyUserId,
+    ipv6: Boolean(ipv6IsEnabled),
+    socksProxyUserId: SOCKS_PROXY_USER_ID,
+  });
 }
 
 function readCredentials(environment = process.env) {
@@ -259,7 +384,22 @@ async function clickFirstVisible(page, selectors, actionName) {
   if (!locator) {
     return false;
   }
-  await locator.click();
+  return clickLocator(locator, actionName);
+}
+
+async function clickLocator(locator, actionName) {
+  try {
+    await locator.click({ timeout: 5000 });
+  } catch (error) {
+    if (!(error instanceof errors.TimeoutError)) {
+      throw error;
+    }
+    log("warn", "browser.control.retry", {
+      control: actionName,
+      reason: "transient-timeout",
+    });
+    return false;
+  }
   log("info", "browser.control.clicked", { control: actionName });
   return true;
 }
@@ -268,9 +408,7 @@ async function clickFirstMatchingText(page, patterns, actionName) {
   for (const pattern of patterns) {
     const locator = page.getByText(pattern, { exact: false }).first();
     if (await locator.count() && await locator.isVisible()) {
-      await locator.click();
-      log("info", "browser.control.clicked", { control: actionName });
-      return true;
+      return clickLocator(locator, actionName);
     }
   }
   return false;
@@ -557,7 +695,7 @@ function sanitizeOpenConnectLine(line) {
   return line.replace(/https?:\/\/[^\s]+/g, (rawUrl) => safeLocation(rawUrl));
 }
 
-function streamSanitizedLines(stream, streamName) {
+function streamProcessLines(stream, processName, streamName, sanitizeLine = (line) => line) {
   let bufferedText = "";
   stream.setEncoding("utf8");
   stream.on("data", (chunk) => {
@@ -565,19 +703,199 @@ function streamSanitizedLines(stream, streamName) {
     const lines = bufferedText.split(/\r?\n/);
     bufferedText = lines.pop() || "";
     lines.filter(Boolean).forEach((line) => {
-      log("info", "openconnect.output", {
+      log("info", `${processName}.output`, {
         stream: streamName,
-        message: sanitizeOpenConnectLine(line),
+        message: sanitizeLine(line),
       });
     });
   });
   stream.on("end", () => {
     if (bufferedText) {
-      log("info", "openconnect.output", {
+      log("info", `${processName}.output`, {
         stream: streamName,
-        message: sanitizeOpenConnectLine(bufferedText),
+        message: sanitizeLine(bufferedText),
       });
     }
+  });
+}
+
+function probeProxyProtocol(port, requestBytes, responseIsValid, protocolName) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const responseChunks = [];
+    let settled = false;
+    const finish = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    socket.setTimeout(1000);
+    socket.once("connect", () => socket.write(requestBytes));
+    socket.on("data", (chunk) => {
+      responseChunks.push(chunk);
+      if (responseIsValid(Buffer.concat(responseChunks))) {
+        finish();
+      }
+    });
+    socket.once("error", (error) => {
+      finish(new Error(`${protocolName} proxy probe failed: ${error.message}`));
+    });
+    socket.once("timeout", () => {
+      finish(new Error(`${protocolName} proxy probe timed out`));
+    });
+    socket.once("close", () => {
+      finish(new Error(`${protocolName} proxy returned an invalid response`));
+    });
+  });
+}
+
+function probeHttpProxy() {
+  const requestBytes = Buffer.from(
+    "GET http://tinyproxy.health/ HTTP/1.1\r\n"
+      + "Host: tinyproxy.health\r\n"
+      + "Connection: close\r\n\r\n",
+  );
+  return probeProxyProtocol(
+    HTTP_PROXY_PORT,
+    requestBytes,
+    (response) => /^HTTP\/1\.[01] 200\b/.test(response.toString("utf8")),
+    "HTTP",
+  );
+}
+
+function probeSocksProxy() {
+  return probeProxyProtocol(
+    SOCKS_PROXY_PORT,
+    Buffer.from([0x05, 0x01, 0x00]),
+    (response) => response.length >= 2 && response[0] === 0x05 && response[1] === 0x00,
+    "SOCKS5",
+  );
+}
+
+async function waitForProxyProbe(probe, port) {
+  const deadline = Date.now() + PROXY_START_TIMEOUT_MILLISECONDS;
+  let lastError = new Error("Proxy probe was not attempted");
+  while (Date.now() < deadline) {
+    try {
+      await probe();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw new Error(`Proxy on port ${port} did not become ready: ${lastError.message}`);
+}
+
+function proxyDefinitions() {
+  return [
+    {
+      arguments: ["-d", "-c", "/etc/tinyproxy/tinyproxy.conf"],
+      command: "tinyproxy",
+      name: "http_proxy",
+      port: HTTP_PROXY_PORT,
+      probe: probeHttpProxy,
+    },
+    {
+      arguments: ["-i", PROXY_LISTEN_ADDRESS, "-p", String(SOCKS_PROXY_PORT)],
+      command: "microsocks",
+      gid: SOCKS_PROXY_USER_ID,
+      name: "socks_proxy",
+      port: SOCKS_PROXY_PORT,
+      probe: probeSocksProxy,
+      uid: SOCKS_PROXY_USER_ID,
+    },
+  ];
+}
+
+function queueProxyOperation(operation) {
+  const queuedOperation = proxyOperationPromise.then(operation, operation);
+  proxyOperationPromise = queuedOperation.catch(() => {});
+  return queuedOperation;
+}
+
+function startProxyProcess(definition) {
+  log("info", `${definition.name}.start.enter`, {
+    address: PROXY_LISTEN_ADDRESS,
+    port: definition.port,
+  });
+  const proxyProcess = spawn(definition.command, definition.arguments, {
+    gid: definition.gid,
+    stdio: ["ignore", "pipe", "pipe"],
+    uid: definition.uid,
+  });
+  activeProxyProcesses.set(definition.name, proxyProcess);
+  streamProcessLines(proxyProcess.stdout, definition.name, "stdout");
+  streamProcessLines(proxyProcess.stderr, definition.name, "stderr");
+  proxyProcess.once("error", (error) => {
+    if (activeProxyProcesses.get(definition.name) === proxyProcess) {
+      activeProxyProcesses.delete(definition.name);
+    }
+    log("error", `${definition.name}.start.error`, { error: error.message });
+  });
+  proxyProcess.once("exit", (code, signal) => {
+    if (activeProxyProcesses.get(definition.name) === proxyProcess) {
+      activeProxyProcesses.delete(definition.name);
+    }
+    log("warn", `${definition.name}.start.exit`, { code, signal });
+  });
+}
+
+async function ensureProxyProcessesRunning() {
+  await queueProxyOperation(async () => {
+    const definitions = proxyDefinitions();
+    definitions
+      .filter((definition) => !activeProxyProcesses.has(definition.name))
+      .forEach(startProxyProcess);
+    await Promise.all(definitions.map(
+      (definition) => waitForProxyProbe(definition.probe, definition.port),
+    ));
+    log("info", "proxies.ready", {
+      httpPort: HTTP_PROXY_PORT,
+      socksPort: SOCKS_PROXY_PORT,
+    });
+  });
+}
+
+function waitForProcessExit(childProcess, timeoutMilliseconds) {
+  if (!isProcessRunning(childProcess)) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      if (isProcessRunning(childProcess)) {
+        childProcess.kill("SIGKILL");
+      }
+      resolve();
+    }, timeoutMilliseconds);
+    childProcess.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
+async function stopProxyProcesses(reason) {
+  await queueProxyOperation(async () => {
+    const proxyProcesses = [...activeProxyProcesses.values()];
+    if (!proxyProcesses.length) {
+      return;
+    }
+    log("warn", "proxies.stop.enter", { reason });
+    proxyProcesses
+      .filter(isProcessRunning)
+      .forEach((proxyProcess) => proxyProcess.kill("SIGTERM"));
+    await Promise.all(proxyProcesses.map(
+      (proxyProcess) => waitForProcessExit(proxyProcess, 5000),
+    ));
+    log("warn", "proxies.stop.exit", { reason });
   });
 }
 
@@ -589,9 +907,12 @@ async function monitorTunnel(openConnectProcess) {
   const startupDeadline = Date.now() + WATCHDOG_STARTUP_GRACE_MILLISECONDS;
   let consecutiveFailures = 0;
   let tunnelWasObserved = false;
-  while (!shutdownRequested && openConnectProcess.exitCode === null) {
-    await new Promise((resolve) => setTimeout(resolve, WATCHDOG_INTERVAL_MILLISECONDS));
-    if (shutdownRequested || openConnectProcess.exitCode !== null) {
+  while (!shutdownRequested && isProcessRunning(openConnectProcess)) {
+    const checkDelayMilliseconds = tunnelWasObserved
+      ? WATCHDOG_INTERVAL_MILLISECONDS
+      : Math.min(WATCHDOG_INTERVAL_MILLISECONDS, 1000);
+    await new Promise((resolve) => setTimeout(resolve, checkDelayMilliseconds));
+    if (shutdownRequested || !isProcessRunning(openConnectProcess)) {
       break;
     }
     const tunnelExists = fs.existsSync(`/sys/class/net/${TUNNEL_INTERFACE}`);
@@ -599,10 +920,12 @@ async function monitorTunnel(openConnectProcess) {
       continue;
     }
     try {
-      await runHealthcheck(false);
+      await runTunnelHealthcheck(false);
+      await ensureProxyProcessesRunning();
       tunnelWasObserved = true;
       consecutiveFailures = 0;
     } catch (error) {
+      await stopProxyProcesses("tunnel-health-lost");
       consecutiveFailures += 1;
       log("warn", "watchdog.check.failed", {
         consecutiveFailures,
@@ -637,19 +960,31 @@ function runOpenConnect() {
     stdio: ["ignore", "pipe", "pipe"],
   });
   activeOpenConnectProcess = openConnectProcess;
-  streamSanitizedLines(openConnectProcess.stdout, "stdout");
-  streamSanitizedLines(openConnectProcess.stderr, "stderr");
+  streamProcessLines(
+    openConnectProcess.stdout,
+    "openconnect",
+    "stdout",
+    sanitizeOpenConnectLine,
+  );
+  streamProcessLines(
+    openConnectProcess.stderr,
+    "openconnect",
+    "stderr",
+    sanitizeOpenConnectLine,
+  );
   monitorTunnel(openConnectProcess).catch((error) => {
     log("error", "watchdog.fatal", { error: error.message });
-    if (openConnectProcess.exitCode === null) {
+    void stopProxyProcesses("watchdog-fatal");
+    if (isProcessRunning(openConnectProcess)) {
       openConnectProcess.kill("SIGTERM");
     }
   });
   return new Promise((resolve, reject) => {
     openConnectProcess.once("error", reject);
-    openConnectProcess.once("exit", (code, signal) => {
+    openConnectProcess.once("exit", async (code, signal) => {
       log("warn", "openconnect.start.exit", { code, signal });
       activeOpenConnectProcess = null;
+      await stopProxyProcesses("openconnect-exited");
       resolve(code === null ? 1 : code);
     });
   });
@@ -658,6 +993,7 @@ function runOpenConnect() {
 async function connectForever() {
   validateVpnServer();
   readCredentials();
+  await configureProxyKillSwitch();
   await captureOriginalPublicIp();
   while (!shutdownRequested) {
     const exitCode = await runOpenConnect();
@@ -669,7 +1005,7 @@ async function connectForever() {
   }
 }
 
-async function runHealthcheck(emitSuccess = true) {
+async function runTunnelHealthcheck(emitSuccess = true) {
   if (!fs.existsSync(`/sys/class/net/${TUNNEL_INTERFACE}`)) {
     throw new Error(`Tunnel interface ${TUNNEL_INTERFACE} is absent`);
   }
@@ -683,6 +1019,19 @@ async function runHealthcheck(emitSuccess = true) {
   }
   if (emitSuccess) {
     process.stdout.write("healthy: public IP differs from the pre-VPN public IP\n");
+  }
+}
+
+async function runHealthcheck(emitSuccess = true) {
+  await runTunnelHealthcheck(false);
+  await Promise.all([
+    probeHttpProxy(),
+    probeSocksProxy(),
+  ]);
+  if (emitSuccess) {
+    process.stdout.write(
+      "healthy: VPN egress and HTTP/SOCKS proxy listeners are available\n",
+    );
   }
 }
 
@@ -718,6 +1067,7 @@ function installSignalHandlers() {
     process.on(signalName, () => {
       shutdownRequested = true;
       log("warn", "shutdown.requested", { signal: signalName });
+      void stopProxyProcesses("shutdown-requested");
       if (activeOpenConnectProcess) {
         activeOpenConnectProcess.kill("SIGTERM");
       }

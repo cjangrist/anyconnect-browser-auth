@@ -43,10 +43,13 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
       curl \
       iproute2 \
+      iptables \
       libgnutls30t64 \
       liblz4-1 \
       libxml2 \
+      microsocks \
       tini \
+      tinyproxy \
       vpnc-scripts \
       zlib1g \
     && npm install --global agent-browser@0.34.0
@@ -60,7 +63,10 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY vpn.js ./
 RUN chmod 0555 /app/vpn.js
+
+EXPOSE 8080 1080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/vpn.js", "connect"]
