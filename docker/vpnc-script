@@ -1,0 +1,13 @@
+#!/bin/sh
+
+/usr/share/vpnc-scripts/vpnc-script
+script_status=$?
+
+/app/vpn.js configure-dns
+resolver_status=$?
+
+if [ "$resolver_status" -ne 0 ]; then
+  exit "$resolver_status"
+fi
+
+exit "$script_status"
