@@ -445,9 +445,9 @@ client that can reach either published port can use the VPN egress while it is u
 The container namespace uses only `1.1.1.1`, `1.0.0.1`, `8.8.8.8`, and `8.8.4.4` for
 DNS. Compose declares those addresses as Docker resolver upstreams, while the
 supervisor writes and verifies that exact resolver file before its baseline request,
-OpenConnect, or browser authentication start. The wrapped VPN route script reasserts
-the same exact file after every OpenConnect network event and fails the event if the
-write cannot be verified. This intentionally replaces Docker's embedded resolver,
+OpenConnect, or browser authentication start. The wrapped VPN route script invokes the
+same supervisor resolver command after every OpenConnect network event and fails the
+event if the write cannot be verified. This intentionally replaces Docker's embedded resolver,
 service-name DNS, search domains, and resolver options for the entire container
 namespace. Proxy-owned DNS packets are therefore rejected unless the route uses
 `tun0`.

@@ -3,16 +3,11 @@
 /usr/share/vpnc-scripts/vpnc-script
 script_status=$?
 
-mkdir -p /run/vpnc || exit 1
-resolver_staging_file=/run/vpnc/static-resolv.conf
+/app/vpn.js configure-dns
+resolver_status=$?
 
-printf '%s\n' \
-  'nameserver 1.1.1.1' \
-  'nameserver 1.0.0.1' \
-  'nameserver 8.8.8.8' \
-  'nameserver 8.8.4.4' > "$resolver_staging_file" || exit 1
-
-cat "$resolver_staging_file" > /etc/resolv.conf || exit 1
-cmp -s "$resolver_staging_file" /etc/resolv.conf || exit 1
+if [ "$resolver_status" -ne 0 ]; then
+  exit "$resolver_status"
+fi
 
 exit "$script_status"

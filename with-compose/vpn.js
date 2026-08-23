@@ -1161,6 +1161,9 @@ function readOriginalPublicIp() {
 }
 
 function assertVpnPublicIp(currentPublicIp, originalPublicIp, requestLabel) {
+  if (net.isIP(currentPublicIp) !== net.isIP(originalPublicIp)) {
+    throw new Error(`${requestLabel} egress changed address family from the pre-VPN baseline`);
+  }
   if (currentPublicIp === originalPublicIp) {
     throw new Error(`${requestLabel} egress returned the pre-VPN public IP`);
   }
@@ -1263,6 +1266,10 @@ async function main() {
   }
   if (command === "self-test") {
     await runSelfTest();
+    return;
+  }
+  if (command === "configure-dns") {
+    writeStaticResolverConfiguration();
     return;
   }
   throw new Error(`Unknown command: ${command}`);
