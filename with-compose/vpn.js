@@ -399,6 +399,11 @@ async function fetchPublicIp(proxyUrl = "", requestLabel = "direct") {
       `${requestLabel} curl to ${new URL(PUBLIC_IP_ENDPOINT).hostname} returned an invalid public IP address`,
     );
   }
+  if (net.isIP(candidateIp) !== Number(PUBLIC_IP_FAMILY)) {
+    throw new Error(
+      `${requestLabel} curl to ${new URL(PUBLIC_IP_ENDPOINT).hostname} returned an IP outside IPv${PUBLIC_IP_FAMILY}`,
+    );
+  }
   log("debug", "public_ip.fetch.exit", {
     endpoint: new URL(PUBLIC_IP_ENDPOINT).hostname,
   });
