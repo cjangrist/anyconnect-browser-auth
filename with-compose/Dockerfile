@@ -64,8 +64,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY vpnc-script /app/vpnc-script
 COPY vpn.js ./
-RUN chmod 0555 /app/vpn.js
+RUN chmod 0555 /app/vpn.js /app/vpnc-script
 
 EXPOSE 8080 1080
 

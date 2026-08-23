@@ -338,11 +338,14 @@ result later requires all of the following:
 
 1. `VPN_TUNNEL_INTERFACE` exists under `/sys/class/net`.
 2. The baseline file exists and contains a syntactically valid IP address.
-3. A new `curl` request succeeds within seven seconds.
+3. Concurrent direct, HTTP-proxy, and SOCKS5-proxy `curl` requests each succeed within
+   seven seconds.
 4. The new response is a valid IP address.
 5. The new address differs from the pre-VPN baseline.
-6. The HTTP proxy returns a valid HTTP response to its internal status request.
-7. The SOCKS5 proxy accepts the no-authentication method in a SOCKS5 handshake.
+6. A hostname request through the HTTP proxy returns a valid public IP address that
+   differs from the pre-VPN baseline.
+7. A hostname request through the SOCKS5 proxy returns a valid public IP address that
+   differs from the pre-VPN baseline.
 
 This proves that the expected interface exists and that real application traffic has
 observable VPN egress, with both requested proxy endpoints available.
@@ -370,11 +373,13 @@ failures without repeating the browser flow when its session remains usable.
 
 ### 2. Node.js tunnel watchdog
 
-The supervisor checks the full health invariant every 30 seconds after startup. Three
+The supervisor checks direct tunnel egress every 30 seconds after startup. Three
 consecutive failures trigger a controlled `SIGTERM` to the OpenConnect child. The
 outer loop waits five seconds, starts a new OpenConnect process, and completes SSO
 again. Browser authentication therefore also recovers from expired or irrecoverable
-sessions.
+sessions. The same watchdog performs real hostname egress through each proxy after it
+starts; a failed proxy is stopped and recreated without unnecessarily reauthenticating
+OpenConnect.
 
 The proxy processes start only after the first successful tunnel check. Any failed
 tunnel check stops both proxies immediately, before the watchdog waits for its failure
@@ -383,8 +388,8 @@ fall back to the container's pre-VPN route.
 
 A kernel firewall provides the independent data-plane kill switch. Output owned by
 the `tinyproxy` or `nobody` UID may create traffic only through `tun0`. The only
-non-tunnel exception is established response traffic whose source port is the HTTP or
-SOCKS listener, which allows replies to clients. Equivalent IPv4 and IPv6 rules are
+non-tunnel exception is established response traffic from the HTTP or SOCKS listener.
+IPv4 rules and, when IPv6 is enabled in the container, equivalent IPv6 rules are
 installed before OpenConnect or either proxy starts. Even if a proxy process outlives
 the tunnel briefly, its direct `eth0` egress is rejected by the kernel.
 
@@ -426,8 +431,8 @@ namespace and drop proxy privileges:
 - `KILL` is added so the supervisor can stop proxy children after they drop to the
   `tinyproxy` and `nobody` users.
 - `NET_ADMIN` is added back for `tun0`, routes, DNS, and firewall rules.
-- `SETUID` and `SETGID` are added so Tinyproxy and MicroSocks can run as the
-  unprivileged `tinyproxy` and `nobody` users after binding their ports.
+- `SETUID` and `SETGID` let the supervisor start MicroSocks as `nobody` and let
+  Tinyproxy drop to the unprivileged `tinyproxy` user during startup.
 - `/dev/net/tun` is passed explicitly.
 - No host network mode is used.
 - Only TCP ports `8080` and `1080` are published, both on `0.0.0.0`.
@@ -436,6 +441,16 @@ OpenConnect's route, DNS, and firewall changes therefore affect the container
 namespace, not the host namespace. UID-scoped IPv4/IPv6 rules reject direct proxy
 egress outside `tun0`. Because proxy authentication is intentionally disabled, any
 client that can reach either published port can use the VPN egress while it is up.
+
+The container namespace uses only `1.1.1.1`, `1.0.0.1`, `8.8.8.8`, and `8.8.4.4` for
+DNS. Compose declares those addresses as Docker resolver upstreams, while the
+supervisor writes and verifies that exact resolver file before its baseline request,
+OpenConnect, or browser authentication start. The wrapped VPN route script reasserts
+the same exact file after every OpenConnect network event and fails the event if the
+write cannot be verified. This intentionally replaces Docker's embedded resolver,
+service-name DNS, search domains, and resolver options for the entire container
+namespace. Proxy-owned DNS packets are therefore rejected unless the route uses
+`tun0`.
 
 ### Credential handling
 
@@ -505,6 +520,8 @@ runtime libraries, `curl`, `iproute2`, `iptables`, `tini`, `tinyproxy`, `microso
 - agent-browser `0.34.0` for contained browser diagnostics and egress verification.
 - The compiled OpenConnect runtime from the builder stage.
 - The executable `/app/vpn.js` supervisor.
+- The executable `/app/vpnc-script` wrapper, which runs the distribution route script
+  and then verifies the required static resolver file.
 
 Node dependencies and the OpenConnect commit are exactly pinned. The Playwright base
 image is tag-pinned rather than digest-pinned; pin it by digest as well if byte-for-byte
@@ -549,7 +566,7 @@ docker compose exec -T vpn /app/vpn.js self-test
 Expected output:
 
 ```text
-self-test passed: environment credentials, RFC 6238 TOTP, and curl verified
+self-test passed: credentials, RFC 6238 TOTP, static DNS, and curl verified
 ```
 
 The test never prints the generated code or configured seed.
@@ -864,7 +881,7 @@ Before publishing a change, verify:
 6. `tun0` appears in the container.
 7. The manual healthcheck passes and both proxy listeners are present.
 8. Ports `8080` and `1080` are published on `0.0.0.0`.
-9. IPv4 and IPv6 UID-scoped kill-switch chains are installed.
+9. IPv4 and, when enabled in the container, IPv6 UID-scoped kill-switch chains are installed.
 10. Proxy-owned attempts through `eth0` are rejected while client replies still work.
 11. Host and container public IPs differ under the full-tunnel model.
 12. HTTP and SOCKS5 proxy egress both differ from host egress, and their proxy-UID

@@ -34,8 +34,9 @@ const PROXY_START_TIMEOUT_MILLISECONDS = 5000;
 const PUBLIC_IP_ENDPOINT = process.env.VPN_PUBLIC_IP_ENDPOINT
   || "https://ifconfig.io/ip";
 const RUNTIME_DIRECTORY = path.dirname(ORIGINAL_PUBLIC_IP_FILE);
+const RESOLVER_CONFIGURATION_PATH = "/etc/resolv.conf";
 const SOCKS_PROXY_PORT = 1080;
-const SOCKS_PROXY_USER_ID = 65534;
+const STATIC_DNS_SERVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"];
 const TUNNEL_INTERFACE = process.env.VPN_TUNNEL_INTERFACE || "tun0";
 const VPN_SERVER = process.env.VPN_SERVER || "";
 const WATCHDOG_FAILURE_THRESHOLD = Number(
@@ -61,6 +62,8 @@ let activeOpenConnectProcess = null;
 const activeProxyProcesses = new Map();
 let proxyOperationPromise = Promise.resolve();
 let shutdownRequested = false;
+let socksProxyGroupId = null;
+let socksProxyUserId = null;
 
 function log(level, event, details = {}) {
   const serializedDetails = Object.entries(details)
@@ -82,8 +85,18 @@ function runCommand(command, argumentsList) {
     const stderrChunks = [];
     commandProcess.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
     commandProcess.stderr.on("data", (chunk) => stderrChunks.push(chunk));
-    commandProcess.once("error", reject);
-    commandProcess.once("exit", (code) => {
+    let settled = false;
+    commandProcess.once("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
+    commandProcess.once("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       resolve({
         code,
         stderr: Buffer.concat(stderrChunks).toString("utf8").trim(),
@@ -116,6 +129,48 @@ async function resolveSystemUserId(username) {
     throw new Error(`System user ${username} has an invalid user ID`);
   }
   return userId;
+}
+
+async function resolveSystemGroupId(groupName) {
+  const result = await requireCommandSuccess("getent", ["group", groupName]);
+  const groupFields = result.stdout.split(":");
+  const groupId = Number(groupFields[2]);
+  if (!Number.isSafeInteger(groupId) || groupId < 1) {
+    throw new Error(`System group ${groupName} has an invalid group ID`);
+  }
+  return groupId;
+}
+
+function staticResolverConfiguration() {
+  return `${STATIC_DNS_SERVERS.map((server) => `nameserver ${server}`).join("\n")}\n`;
+}
+
+function assertStaticResolverConfiguration() {
+  const resolverLines = fs.readFileSync(RESOLVER_CONFIGURATION_PATH, "utf8")
+    .trim()
+    .split("\n");
+  const expectedLines = STATIC_DNS_SERVERS.map((server) => `nameserver ${server}`);
+  if (JSON.stringify(resolverLines) !== JSON.stringify(expectedLines)) {
+    throw new Error("Resolver configuration does not contain only the required static DNS servers");
+  }
+}
+
+function writeStaticResolverConfiguration() {
+  log("info", "dns.static.configure.enter", { servers: STATIC_DNS_SERVERS });
+  const resolverConfiguration = staticResolverConfiguration();
+  const temporaryPath = path.join(
+    RUNTIME_DIRECTORY,
+    `resolv.conf.${process.pid}.${Date.now()}`,
+  );
+  fs.mkdirSync(RUNTIME_DIRECTORY, { mode: 0o700, recursive: true });
+  fs.writeFileSync(temporaryPath, resolverConfiguration, { mode: 0o644 });
+  try {
+    fs.copyFileSync(temporaryPath, RESOLVER_CONFIGURATION_PATH);
+    assertStaticResolverConfiguration();
+  } finally {
+    fs.unlinkSync(temporaryPath);
+  }
+  log("info", "dns.static.configure.exit", { servers: STATIC_DNS_SERVERS });
 }
 
 async function ensureFirewallOutputJump(command, userId) {
@@ -172,9 +227,11 @@ async function configureFirewallFamily(command, proxyPolicies) {
 async function configureProxyKillSwitch() {
   log("info", "kill_switch.configure.enter", { interface: TUNNEL_INTERFACE });
   const httpProxyUserId = await resolveSystemUserId("tinyproxy");
+  socksProxyUserId = await resolveSystemUserId("nobody");
+  socksProxyGroupId = await resolveSystemGroupId("nogroup");
   const proxyPolicies = [
     { listenPort: HTTP_PROXY_PORT, userId: httpProxyUserId },
-    { listenPort: SOCKS_PROXY_PORT, userId: SOCKS_PROXY_USER_ID },
+    { listenPort: SOCKS_PROXY_PORT, userId: socksProxyUserId },
   ];
   await configureFirewallFamily("iptables", proxyPolicies);
   const ipv6IsEnabled = fs.existsSync("/proc/net/if_inet6")
@@ -185,7 +242,8 @@ async function configureProxyKillSwitch() {
   log("info", "kill_switch.configure.exit", {
     httpProxyUserId,
     ipv6: Boolean(ipv6IsEnabled),
-    socksProxyUserId: SOCKS_PROXY_USER_ID,
+    socksProxyGroupId,
+    socksProxyUserId,
   });
 }
 
@@ -289,7 +347,7 @@ function sanitizeAuthenticationMessage(rawMessage, credentials) {
   );
 }
 
-async function fetchPublicIp() {
+async function fetchPublicIp(proxyUrl = "", requestLabel = "direct") {
   log("debug", "public_ip.fetch.enter", {
     endpoint: new URL(PUBLIC_IP_ENDPOINT).hostname,
   });
@@ -299,24 +357,42 @@ async function fetchPublicIp() {
     "--show-error",
     "--max-time",
     "7",
-    PUBLIC_IP_ENDPOINT,
   ];
+  if (proxyUrl) {
+    curlArguments.push("--proxy", proxyUrl);
+  }
+  curlArguments.push(PUBLIC_IP_ENDPOINT);
   const curlResult = await new Promise((resolve, reject) => {
     const curlProcess = spawn("curl", curlArguments, { stdio: ["ignore", "pipe", "pipe"] });
     const stdoutChunks = [];
     const stderrChunks = [];
     curlProcess.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
     curlProcess.stderr.on("data", (chunk) => stderrChunks.push(chunk));
-    curlProcess.once("error", reject);
-    curlProcess.once("exit", (code) => resolve({ code, stderrChunks, stdoutChunks }));
+    let settled = false;
+    curlProcess.once("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
+    curlProcess.once("close", (code) => {
+      if (!settled) {
+        settled = true;
+        resolve({ code, stderrChunks, stdoutChunks });
+      }
+    });
   });
   if (curlResult.code !== 0) {
     const errorMessage = Buffer.concat(curlResult.stderrChunks).toString("utf8").trim();
-    throw new Error(`curl ifconfig.io failed with code ${curlResult.code}: ${errorMessage}`);
+    throw new Error(
+      `${requestLabel} curl to ${new URL(PUBLIC_IP_ENDPOINT).hostname} failed with code ${curlResult.code}: ${errorMessage}`,
+    );
   }
   const candidateIp = Buffer.concat(curlResult.stdoutChunks).toString("utf8").trim();
   if (!net.isIP(candidateIp)) {
-    throw new Error("curl ifconfig.io returned an invalid public IP address");
+    throw new Error(
+      `${requestLabel} curl to ${new URL(PUBLIC_IP_ENDPOINT).hostname} returned an invalid public IP address`,
+    );
   }
   log("debug", "public_ip.fetch.exit", {
     endpoint: new URL(PUBLIC_IP_ENDPOINT).hostname,
@@ -795,6 +871,9 @@ async function waitForProxyProbe(probe, port) {
 }
 
 function proxyDefinitions() {
+  if (!Number.isSafeInteger(socksProxyGroupId) || !Number.isSafeInteger(socksProxyUserId)) {
+    throw new Error("SOCKS proxy user and group IDs are not configured");
+  }
   return [
     {
       arguments: ["-d", "-c", "/etc/tinyproxy/tinyproxy.conf"],
@@ -806,11 +885,11 @@ function proxyDefinitions() {
     {
       arguments: ["-i", PROXY_LISTEN_ADDRESS, "-p", String(SOCKS_PROXY_PORT)],
       command: "microsocks",
-      gid: SOCKS_PROXY_USER_ID,
+      gid: socksProxyGroupId,
       name: "socks_proxy",
       port: SOCKS_PROXY_PORT,
       probe: probeSocksProxy,
-      uid: SOCKS_PROXY_USER_ID,
+      uid: socksProxyUserId,
     },
   ];
 }
@@ -819,6 +898,12 @@ function queueProxyOperation(operation) {
   const queuedOperation = proxyOperationPromise.then(operation, operation);
   proxyOperationPromise = queuedOperation.catch(() => {});
   return queuedOperation;
+}
+
+function canServeProxyTraffic() {
+  return !shutdownRequested
+    && Boolean(activeOpenConnectProcess)
+    && isProcessRunning(activeOpenConnectProcess);
 }
 
 function startProxyProcess(definition) {
@@ -850,6 +935,10 @@ function startProxyProcess(definition) {
 
 async function ensureProxyProcessesRunning() {
   await queueProxyOperation(async () => {
+    if (!canServeProxyTraffic()) {
+      log("warn", "proxies.start.skipped", { reason: "openconnect-not-running" });
+      return;
+    }
     const definitions = proxyDefinitions();
     definitions
       .filter((definition) => !activeProxyProcesses.has(definition.name))
@@ -868,17 +957,37 @@ function waitForProcessExit(childProcess, timeoutMilliseconds) {
   if (!isProcessRunning(childProcess)) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    let killTimeout = null;
+    let settled = false;
+    const complete = (error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
     const timeout = setTimeout(() => {
       if (isProcessRunning(childProcess)) {
-        childProcess.kill("SIGKILL");
+        const killed = childProcess.kill("SIGKILL");
+        if (!killed) {
+          complete(new Error(`Process ${childProcess.pid} could not be terminated`));
+          return;
+        }
+        killTimeout = setTimeout(() => {
+          complete(new Error(`Process ${childProcess.pid} did not exit after SIGKILL`));
+        }, timeoutMilliseconds);
       }
-      resolve();
     }, timeoutMilliseconds);
-    childProcess.once("exit", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
+    childProcess.once("exit", () => complete());
   });
 }
 
@@ -921,21 +1030,35 @@ async function monitorTunnel(openConnectProcess) {
     }
     try {
       await runTunnelHealthcheck(false);
-      await ensureProxyProcessesRunning();
-      tunnelWasObserved = true;
-      consecutiveFailures = 0;
     } catch (error) {
       await stopProxyProcesses("tunnel-health-lost");
+      if (!tunnelWasObserved && Date.now() < startupDeadline) {
+        log("debug", "watchdog.startup.pending", { error: error.message });
+        continue;
+      }
       consecutiveFailures += 1;
       log("warn", "watchdog.check.failed", {
         consecutiveFailures,
         error: error.message,
       });
+      if (consecutiveFailures >= WATCHDOG_FAILURE_THRESHOLD) {
+        log("error", "watchdog.reconnect.triggered", { consecutiveFailures });
+        openConnectProcess.kill("SIGTERM");
+        break;
+      }
+      continue;
     }
-    if (consecutiveFailures >= WATCHDOG_FAILURE_THRESHOLD) {
-      log("error", "watchdog.reconnect.triggered", { consecutiveFailures });
-      openConnectProcess.kill("SIGTERM");
+    tunnelWasObserved = true;
+    consecutiveFailures = 0;
+    if (shutdownRequested || !isProcessRunning(openConnectProcess)) {
       break;
+    }
+    try {
+      await ensureProxyProcessesRunning();
+      await runProxyEgressHealthcheck(false);
+    } catch (error) {
+      await stopProxyProcesses("proxy-egress-failed");
+      log("error", "watchdog.proxy.failed", { error: error.message });
     }
   }
   log("info", "watchdog.stop");
@@ -947,6 +1070,7 @@ function runOpenConnect() {
     "--protocol=anyconnect",
     "--external-browser=/app/vpn.js",
     `--interface=${TUNNEL_INTERFACE}`,
+    "--script=/app/vpnc-script",
     "--os=linux-64",
     "--useragent=AnyConnect Linux_64 5.1.11.388",
     "--version-string=5.1.11.388",
@@ -974,7 +1098,10 @@ function runOpenConnect() {
   );
   monitorTunnel(openConnectProcess).catch((error) => {
     log("error", "watchdog.fatal", { error: error.message });
-    void stopProxyProcesses("watchdog-fatal");
+    void stopProxyProcesses("watchdog-fatal").catch((stopError) => {
+      shutdownRequested = true;
+      log("error", "watchdog.proxy_stop.fatal", { error: stopError.message });
+    });
     if (isProcessRunning(openConnectProcess)) {
       openConnectProcess.kill("SIGTERM");
     }
@@ -984,8 +1111,12 @@ function runOpenConnect() {
     openConnectProcess.once("exit", async (code, signal) => {
       log("warn", "openconnect.start.exit", { code, signal });
       activeOpenConnectProcess = null;
-      await stopProxyProcesses("openconnect-exited");
-      resolve(code === null ? 1 : code);
+      try {
+        await stopProxyProcesses("openconnect-exited");
+        resolve(code === null ? 1 : code);
+      } catch (error) {
+        reject(error);
+      }
     });
   });
 }
@@ -993,6 +1124,7 @@ function runOpenConnect() {
 async function connectForever() {
   validateVpnServer();
   readCredentials();
+  writeStaticResolverConfiguration();
   await configureProxyKillSwitch();
   await captureOriginalPublicIp();
   while (!shutdownRequested) {
@@ -1014,20 +1146,52 @@ async function runTunnelHealthcheck(emitSuccess = true) {
     throw new Error("Original public IP state is invalid");
   }
   const currentPublicIp = await fetchPublicIp();
-  if (currentPublicIp === originalPublicIp) {
-    throw new Error("The public IP endpoint still returns the pre-VPN public IP");
-  }
+  assertVpnPublicIp(currentPublicIp, originalPublicIp, "direct");
   if (emitSuccess) {
     process.stdout.write("healthy: public IP differs from the pre-VPN public IP\n");
   }
 }
 
-async function runHealthcheck(emitSuccess = true) {
-  await runTunnelHealthcheck(false);
-  await Promise.all([
-    probeHttpProxy(),
-    probeSocksProxy(),
+function readOriginalPublicIp() {
+  const originalPublicIp = fs.readFileSync(ORIGINAL_PUBLIC_IP_FILE, "utf8").trim();
+  if (!net.isIP(originalPublicIp)) {
+    throw new Error("Original public IP state is invalid");
+  }
+  return originalPublicIp;
+}
+
+function assertVpnPublicIp(currentPublicIp, originalPublicIp, requestLabel) {
+  if (currentPublicIp === originalPublicIp) {
+    throw new Error(`${requestLabel} egress returned the pre-VPN public IP`);
+  }
+}
+
+async function runProxyEgressHealthcheck(emitSuccess = true) {
+  const originalPublicIp = readOriginalPublicIp();
+  const [httpPublicIp, socksPublicIp] = await Promise.all([
+    fetchPublicIp(`http://127.0.0.1:${HTTP_PROXY_PORT}`, "HTTP proxy"),
+    fetchPublicIp(`socks5h://127.0.0.1:${SOCKS_PROXY_PORT}`, "SOCKS5 proxy"),
   ]);
+  assertVpnPublicIp(httpPublicIp, originalPublicIp, "HTTP proxy");
+  assertVpnPublicIp(socksPublicIp, originalPublicIp, "SOCKS5 proxy");
+  if (emitSuccess) {
+    process.stdout.write("healthy: HTTP/SOCKS proxy egress differs from the pre-VPN public IP\n");
+  }
+}
+
+async function runHealthcheck(emitSuccess = true) {
+  if (!fs.existsSync(`/sys/class/net/${TUNNEL_INTERFACE}`)) {
+    throw new Error(`Tunnel interface ${TUNNEL_INTERFACE} is absent`);
+  }
+  const originalPublicIp = readOriginalPublicIp();
+  const [directPublicIp, httpPublicIp, socksPublicIp] = await Promise.all([
+    fetchPublicIp(),
+    fetchPublicIp(`http://127.0.0.1:${HTTP_PROXY_PORT}`, "HTTP proxy"),
+    fetchPublicIp(`socks5h://127.0.0.1:${SOCKS_PROXY_PORT}`, "SOCKS5 proxy"),
+  ]);
+  assertVpnPublicIp(directPublicIp, originalPublicIp, "direct");
+  assertVpnPublicIp(httpPublicIp, originalPublicIp, "HTTP proxy");
+  assertVpnPublicIp(socksPublicIp, originalPublicIp, "SOCKS5 proxy");
   if (emitSuccess) {
     process.stdout.write(
       "healthy: VPN egress and HTTP/SOCKS proxy listeners are available\n",
@@ -1056,9 +1220,10 @@ async function runSelfTest() {
   }
   const credentials = readCredentials();
   generateTotp(credentials.totpSecret);
+  assertStaticResolverConfiguration();
   await fetchPublicIp();
   process.stdout.write(
-    "self-test passed: environment credentials, RFC 6238 TOTP, and curl verified\n",
+    "self-test passed: credentials, RFC 6238 TOTP, static DNS, and curl verified\n",
   );
 }
 
@@ -1067,7 +1232,9 @@ function installSignalHandlers() {
     process.on(signalName, () => {
       shutdownRequested = true;
       log("warn", "shutdown.requested", { signal: signalName });
-      void stopProxyProcesses("shutdown-requested");
+      void stopProxyProcesses("shutdown-requested").catch((error) => {
+        log("error", "shutdown.proxy_stop.failed", { error: error.message });
+      });
       if (activeOpenConnectProcess) {
         activeOpenConnectProcess.kill("SIGTERM");
       }
@@ -1103,5 +1270,5 @@ async function main() {
 
 main().catch((error) => {
   log("error", "fatal", { error: error.message });
-  process.exitCode = 1;
+  process.exit(1);
 });
