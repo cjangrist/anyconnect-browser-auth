@@ -1,0 +1,10 @@
+{
+  "name": "anyconnect-saml-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous AnyConnect SAML and TOTP sidecar",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "1.62.0"
+  }
+}

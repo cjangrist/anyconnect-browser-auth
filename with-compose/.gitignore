@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.sample
+*.login.txt
+node_modules/
+tmp/
+trash/
