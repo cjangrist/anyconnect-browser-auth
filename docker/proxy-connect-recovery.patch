@@ -1,0 +1,170 @@
+diff --git a/microsocks/sockssrv.c b/microsocks/sockssrv.c
+index dbad9c2..0dbe11c 100644
+--- a/microsocks/sockssrv.c
++++ b/microsocks/sockssrv.c
+@@ -33,6 +33,8 @@
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <limits.h>
++#include <sys/time.h>
++#include <time.h>
+ #include "server.h"
+ #include "sblist.h"
+ 
+@@ -113,13 +115,44 @@ struct thread {
+ static void dolog(const char* fmt, ...) { }
+ #endif
+ 
+-static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union* bindaddr) {
+-	int af = SOCKADDR_UNION_AF(bindaddr);
+-	if(af == AF_UNSPEC) return list;
+-	struct addrinfo* p;
+-	for(p=list; p; p=p->ai_next)
+-		if(p->ai_family == af) return p;
+-	return list;
++static long long connection_clock_milliseconds(void) {
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (long long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++static int connect_with_timeout(int descriptor, const struct addrinfo *address, int milliseconds) {
++    struct timeval timeout = { milliseconds / 1000, (milliseconds % 1000) * 1000 };
++    int result, saved_error;
++    if (setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout)) return -1;
++    result = connect(descriptor, address->ai_addr, address->ai_addrlen);
++    saved_error = errno;
++    timeout.tv_sec = timeout.tv_usec = 0;
++    if (setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout)) return -1;
++    errno = saved_error == EINPROGRESS ? ETIMEDOUT : saved_error;
++    return result;
++}
++
++static int connect_target_addresses(struct addrinfo *addresses) {
++    long long deadline = connection_clock_milliseconds() + 7500;
++    int saved_error = EHOSTUNREACH;
++    int family = SOCKADDR_UNION_AF(&bind_addr);
++    for (int round = 0; round < 2; round++) {
++        for (struct addrinfo *address = addresses; address; address = address->ai_next) {
++            if (family != AF_UNSPEC && family != address->ai_family) continue;
++            long long remaining = deadline - connection_clock_milliseconds();
++            if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
++            int descriptor = socket(address->ai_family, SOCK_STREAM, 0);
++            if (descriptor < 0) { saved_error = errno; continue; }
++            int bound = family == AF_UNSPEC || bindtoip(descriptor, &bind_addr) == 0;
++            if (bound && connect_with_timeout(descriptor, address, remaining < 2500 ? remaining : 2500) == 0)
++                return descriptor;
++            saved_error = errno;
++            close(descriptor);
++        }
++    }
++    errno = saved_error;
++    return -1;
+ }
+ 
+ static int connect_socks_target(unsigned char *buf, size_t n, struct client *client) {
+@@ -157,11 +190,8 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
+ 	port = (buf[minlen-2] << 8) | buf[minlen-1];
+ 	/* there's no suitable errorcode in rfc1928 for dns lookup failure */
+ 	if(resolve(namebuf, port, &remote)) return -EC_GENERAL_FAILURE;
+-	struct addrinfo* raddr = addr_choose(remote, &bind_addr);
+-	int fd = socket(raddr->ai_family, SOCK_STREAM, 0);
++	int fd = connect_target_addresses(remote);
+ 	if(fd == -1) {
+-		eval_errno:
+-		if(fd != -1) close(fd);
+ 		freeaddrinfo(remote);
+ 		switch(errno) {
+ 			case ETIMEDOUT:
+@@ -183,11 +213,6 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
+ 			return -EC_GENERAL_FAILURE;
+ 		}
+ 	}
+-	if(SOCKADDR_UNION_AF(&bind_addr) == raddr->ai_family &&
+-	   bindtoip(fd, &bind_addr) == -1)
+-		goto eval_errno;
+-	if(connect(fd, raddr->ai_addr, raddr->ai_addrlen) == -1)
+-		goto eval_errno;
+ 
+ 	freeaddrinfo(remote);
+ 	if(CONFIG_LOG) {
+diff --git a/tinyproxy/src/sock.c b/tinyproxy/src/sock.c
+index b3b0920..8326704 100644
+--- a/tinyproxy/src/sock.c
++++ b/tinyproxy/src/sock.c
+@@ -35,6 +35,7 @@
+ #include "conf.h"
+ #include "loop.h"
+ #include "sblist.h"
++#include <time.h>
+ 
+ /*
+  * Return a human readable error for getaddrinfo() and getnameinfo().
+@@ -133,9 +134,28 @@ void set_socket_timeout(int fd) {
+  * the getaddrinfo() library function, which allows for a protocol
+  * independent implementation (mostly for IPv4 and IPv6 addresses.)
+  */
++static long long connection_clock_milliseconds(void) {
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (long long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++static int connect_with_timeout(int descriptor, const struct addrinfo *address, int milliseconds) {
++    struct timeval timeout = { milliseconds / 1000, (milliseconds % 1000) * 1000 };
++    int result, saved_error;
++    if (setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout)) return -1;
++    result = connect(descriptor, address->ai_addr, address->ai_addrlen);
++    saved_error = errno;
++    timeout.tv_sec = timeout.tv_usec = 0;
++    if (setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout)) return -1;
++    errno = saved_error == EINPROGRESS ? ETIMEDOUT : saved_error;
++    return result;
++}
++
+ int opensock (const char *host, int port, const char *bind_to)
+ {
+-        int sockfd, n;
++        int sockfd, n, round;
++        long long deadline;
+         struct addrinfo hints, *res, *ressave;
+         char portstr[6];
+ 
+@@ -162,7 +182,12 @@ int opensock (const char *host, int port, const char *bind_to)
+                     "opensock: getaddrinfo returned for %s:%d", host, port);
+ 
+         ressave = res;
++        deadline = connection_clock_milliseconds() + 7500;
++        for (round = 0; round < 2; round++) {
++        res = ressave;
+         do {
++                long long remaining = deadline - connection_clock_milliseconds();
++                if (remaining <= 0) { res = NULL; break; }
+                 sockfd =
+                     socket (res->ai_family, res->ai_socktype, res->ai_protocol);
+                 if (sockfd < 0)
+@@ -183,13 +208,12 @@ int opensock (const char *host, int port, const char *bind_to)
+                         }
+                 }
+ 
+-                set_socket_timeout(sockfd);
+-
+-                if (connect (sockfd, res->ai_addr, res->ai_addrlen) == 0) {
++                if (connect_with_timeout(sockfd, res, remaining < 2500 ? remaining : 2500) == 0) {
+                         union sockaddr_union *p = (void*) res->ai_addr, u;
+ 			int af = res->ai_addr->sa_family;
+                         unsigned dport = ntohs(af == AF_INET ? p->v4.sin_port : p->v6.sin6_port);
+                         socklen_t slen = sizeof u;
++                        set_socket_timeout(sockfd);
+                         if (dport == config->port) {
+                                 getsockname(sockfd, (void*)&u, &slen);
+                                 loop_records_add(&u);
+@@ -199,6 +223,8 @@ int opensock (const char *host, int port, const char *bind_to)
+ 
+                 close (sockfd);
+         } while ((res = res->ai_next) != NULL);
++        if (res != NULL || connection_clock_milliseconds() >= deadline) break;
++        }
+ 
+         freeaddrinfo (ressave);
+         if (res == NULL) {

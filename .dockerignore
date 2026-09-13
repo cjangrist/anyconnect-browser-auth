@@ -1,7 +1,8 @@
-**/.git
-**/node_modules
-.env
-.env.*
-*.login.txt
-tmp
-trash
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!src/
+!src/**
+!docker/
+!docker/**

@@ -10,4 +10,11 @@ if [ "$resolver_status" -ne 0 ]; then
   exit "$resolver_status"
 fi
 
+/app/vpn.js configure-kill-switch
+kill_switch_status=$?
+
+if [ "$kill_switch_status" -ne 0 ]; then
+  exit "$kill_switch_status"
+fi
+
 exit "$script_status"

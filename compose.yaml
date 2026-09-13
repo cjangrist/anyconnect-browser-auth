@@ -1,13 +1,15 @@
 services:
   vpn:
-    image: ghcr.io/cjangrist/anyconnect-browser-auth:latest
-    pull_policy: always
+    image: ${VPN_IMAGE:-ghcr.io/cjangrist/anyconnect-browser-auth:latest}
+    pull_policy: ${VPN_PULL_POLICY:-always}
+    build: .
     restart: unless-stopped
     cap_drop:
       - ALL
     cap_add:
       - KILL
       - NET_ADMIN
+      - NET_RAW
       - SETGID
       - SETUID
     devices:
@@ -21,22 +23,48 @@ services:
       - name: http-proxy
         target: 8080
         published: "8080"
-        host_ip: 0.0.0.0
+        host_ip: ${VPN_PROXY_HOST_IP:-127.0.0.1}
         protocol: tcp
       - name: socks5-proxy
         target: 1080
         published: "1080"
-        host_ip: 0.0.0.0
+        host_ip: ${VPN_PROXY_HOST_IP:-127.0.0.1}
         protocol: tcp
     environment:
       - VPN_PASSWORD
       - VPN_SERVER
       - VPN_TOTP_SECRET
       - VPN_USERNAME
+      - VPN_BROWSER_PROFILE_DIRECTORY
+      - VPN_BROWSER_TIMEOUT_MILLISECONDS
+      - VPN_KEEPALIVE_TARGETS
+      - VPN_KEEPALIVE_INTERVAL_SECONDS
+      - VPN_KEEPALIVE_STALE_MILLISECONDS
+      - VPN_LIVENESS_INTERVAL_MILLISECONDS
+      - VPN_LIVENESS_STATE_FILE
+      - VPN_LIVENESS_STATE_STALE_MILLISECONDS
+      - VPN_LEAK_CHECK_INTERVAL_MILLISECONDS
+      - VPN_ORIGINAL_PUBLIC_IP_FILE
+      - VPN_PROXY_EGRESS_CHECK_INTERVAL_MILLISECONDS
+      - VPN_PROXY_FAILURE_THRESHOLD
+      - VPN_PROXY_PROBE_TIMEOUT_MILLISECONDS
+      - VPN_PROXY_START_TIMEOUT_MILLISECONDS
+      - VPN_PROXY_SUPERVISE_INTERVAL_MILLISECONDS
+      - VPN_PUBLIC_IP_ENDPOINT
+      - VPN_PUBLIC_IP_FAMILY
+      - VPN_TUNNEL_INTERFACE
+      - VPN_WATCHDOG_FAILURE_THRESHOLD
+      - VPN_WATCHDOG_STARTUP_GRACE_MILLISECONDS
     shm_size: 1gb
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     healthcheck:
       test: ["CMD", "/app/vpn.js", "healthcheck"]
-      interval: ${VPN_HEALTHCHECK_INTERVAL:-15s}
+      interval: ${VPN_HEALTHCHECK_INTERVAL:-60s}
       timeout: ${VPN_HEALTHCHECK_TIMEOUT:-10s}
       retries: ${VPN_HEALTHCHECK_RETRIES:-8}
       start_period: ${VPN_HEALTHCHECK_START_PERIOD:-90s}
