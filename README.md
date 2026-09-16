@@ -235,7 +235,7 @@ Keep the Playwright dependency, lockfile,
 and image tag aligned. Before publishing, build the image and verify fresh SSO,
 Chrome through both proxies, child and container recovery, firewall behavior, and
 sustained traffic. The existing GitHub workflow publishes the image on repository
-push; local commits alone do not publish it.
+pushes to `main`; local commits and PR branch pushes do not publish it.
 
 ## Authentication compatibility and private files
 
