@@ -5,6 +5,9 @@ proxies in one Docker container. OpenConnect owns the VPN protocol and SSO callb
 Playwright completes Microsoft-style username, password, and TOTP forms. The host
 keeps its normal routes and DNS.
 
+Compose also runs a scoped Watchtower updater that follows the published VPN image.
+Both containers use Docker's automatic restart policy.
+
 The HTTP proxy is available at `http://127.0.0.1:8080`; SOCKS5 is available at
 `socks5h://127.0.0.1:1080`. Both published ports default to **localhost only** and
 require no proxy password. Use `socks5h` for proxy-side DNS resolution.
@@ -82,6 +85,23 @@ docker compose ps
 The default image is `ghcr.io/cjangrist/anyconnect-browser-auth:latest` with
 `VPN_PULL_POLICY=always`. Configuration rendering without `--quiet` can print secrets.
 
+For rootless Docker, set `VPN_DOCKER_SOCKET` to the host socket path reported by
+`docker context inspect` (for example `/run/user/1000/docker.sock`, without `unix://`).
+The updater mounts that socket to manage containers; the socket must already exist.
+Its label and project-scope filters select only this stack's opted-in VPN container.
+
+The updater checks on startup and every 60 seconds. A new image is downloaded before
+the VPN is recreated, then unattended SSO establishes a fresh tunnel. Availability
+resumes after authentication; existing connections need client retry. Registry or
+network outages delay updates until a later successful check. Compose's pull policy
+alone only checks when Compose runs.
+
+Both services use `restart: always`, so Docker restarts them after process exits and
+when the Docker daemon starts. The host must already start Docker at boot; rootless
+Docker also needs its user daemon available without an interactive login. No separate
+VPN host service or scheduler is required. A manual `docker compose stop` remains
+effective until you start the stack or restart the Docker daemon.
+
 ## Build and run this checkout locally
 
 Set these non-secret values in your private `.env`:
@@ -89,12 +109,14 @@ Set these non-secret values in your private `.env`:
 ```dotenv
 VPN_IMAGE=anyconnect-browser-auth:local
 VPN_PULL_POLICY=never
+VPN_AUTO_UPDATE_ENABLED=false
 ```
 
-Then build and start:
+Pause the updater before changing the running image, then build and start:
 
 ```bash
-docker compose build
+docker compose stop updater
+docker compose build vpn
 docker compose up -d --wait --wait-timeout 240
 ```
 
@@ -232,7 +254,7 @@ state files live inside the container, with no persistent volume in the supplied
 Compose definition. Recreating the container discards that local runtime state.
 
 Docker does not restart a container just because its health status becomes
-unhealthy; the supervisor performs recovery, and `restart: unless-stopped` handles
+unhealthy; the supervisor performs recovery, and `restart: always` handles
 supervisor exits.
 
 The public-IP check assumes those endpoints use the VPN. Gateways that route all public
@@ -365,10 +387,20 @@ on every push to `main`, including documentation merges, but does not run VPN te
 or deploy a stack. PR branch pushes do not publish. Inspect the Actions result and
 record the image digest for the intended revision.
 
-For a stack using the published image, record its current image ID/digest before
-updating, then run:
+Published-image stacks update automatically through the Compose `updater` service.
+Inspect its checks with `docker compose logs --since 10m updater`; a successful
+scan without an update does not prove container replacement. Confirm the VPN's image
+revision and health after a release. The updater follows images, not Git: changes to
+Compose itself still require a checkout update and `docker compose up`.
+
+The updater image is digest-pinned and excluded from automatic replacement. Upgrade
+that pin deliberately after checking its release notes and Docker compatibility.
+Old VPN images are retained for rollback; image and volume pruning are not enabled.
+
+For an immediate manual update, record the current image ID/digest, then run:
 
 ```bash
+docker compose stop updater
 docker compose pull vpn
 docker compose up -d --wait --wait-timeout 240
 docker compose exec -T vpn /app/vpn.js deep-healthcheck
@@ -377,8 +409,11 @@ docker compose exec -T vpn /app/vpn.js deep-healthcheck
 Complete acceptance with a real page through each proxy. A recreated container
 starts with a fresh browser profile, runs SSO again, and interrupts existing proxy
 connections. Keep a known-good image digest if you need reproducible rollback:
-set `VPN_IMAGE` in the private `.env` to that full `ghcr.io/...@sha256:...` reference,
-then pull/recreate and repeat acceptance. A mutable `latest` tag cannot identify a
+stop the updater, set `VPN_AUTO_UPDATE_ENABLED=false`, and set `VPN_IMAGE` in the
+private `.env` to that full `ghcr.io/...@sha256:...` reference, then pull/recreate and
+repeat acceptance. To resume tracking releases, restore the published `:latest`
+reference, `VPN_PULL_POLICY=always`, and `VPN_AUTO_UPDATE_ENABLED=true`, then run
+`docker compose up -d --wait --wait-timeout 240`. A mutable `latest` tag cannot identify a
 previous release. Locally built stacks use the local-build instructions instead.
 
 ## Authentication compatibility and private files
