@@ -9,6 +9,53 @@ The HTTP proxy is available at `http://127.0.0.1:8080`; SOCKS5 is available at
 `socks5h://127.0.0.1:1080`. Both published ports default to **localhost only** and
 require no proxy password. Use `socks5h` for proxy-side DNS resolution.
 
+## Find your starting point
+
+| Task | Start here |
+| --- | --- |
+| Run the published image | [Startup](#start-from-the-published-image) |
+| Run changes from this checkout | [Local build](#build-and-run-this-checkout-locally) |
+| Understand readiness and recovery | [Lifecycle](#how-the-pieces-connect) and [recovery behavior](#keepalive-health-and-recovery) |
+| Change settings | [Configuration](#configuration) and [.env.sample](.env.sample) |
+| Diagnose a running stack | [Verification](#verification-and-diagnostics) and [symptom guide](#diagnose-by-symptom) |
+| Modify or review the project | [Root contributor guide](AGENTS.md) and [folder map](#repository-map) |
+| Update an image or return to an earlier build | [Image maintenance](#image-maintenance-and-release) |
+
+## How the pieces connect
+
+```mermaid
+flowchart TD
+    Compose[Docker Compose] --> Init[tini]
+    Init --> Supervisor[Node VPN supervisor]
+    Supervisor --> OpenConnect[OpenConnect]
+    OpenConnect --> Auth[Browser SAML and TOTP callback]
+    Auth --> Identity[Identity provider]
+    OpenConnect --> Tunnel[Tunnel interface]
+    OpenConnect --> Hook[Route hook]
+    Hook --> Policy[Static DNS and proxy UID firewall]
+    Supervisor --> Keepalive[Tunnel-bound keepalive and watchdog]
+    Keepalive --> Tunnel
+    Supervisor --> Proxies[Tinyproxy and MicroSocks]
+    Clients[Local proxy clients] --> Proxies
+    Proxies --> Policy
+    Policy --> Tunnel
+    Policy --> Exclusions[Validated gateway split exclusions]
+    Supervisor --> State[Atomic liveness state]
+    Health[Docker healthcheck] --> State
+    Health --> Proxies
+```
+
+Startup establishes DNS and firewall policy and captures the public IP before VPN
+connection. OpenConnect owns the VPN protocol and calls the browser helper for SSO.
+After tunnel liveness and changed egress establish readiness, the supervisor starts
+the proxies. Keepalive/watchdog work remains independent of slower egress checks.
+
+The supervisor repairs failed children or starts a new VPN session. When forced
+OpenConnect cleanup requires a fresh network namespace, it exits so Docker's restart
+policy can restart the container. The route hook refreshes DNS and firewall policy
+after OpenConnect changes routes. All of these network changes happen inside the
+container; using a proxy is how a client chooses to use the VPN.
+
 ## Start from the published image
 
 Requires Linux, Docker Compose v2, `/dev/net/tun`, and permission to grant network
@@ -78,9 +125,10 @@ Docker's routine `healthcheck` reads an atomically published local state file an
 checks both proxy protocols. It makes **no website requests**. The state includes
 readiness and a timestamp, so an old file cannot keep a dead supervisor healthy.
 
-Deeper egress checks run every five minutes. They rotate through a pool of 26 HTTPS
-IP-reporting endpoints and try up to three endpoints per check. A single website's
-rate limit, invalid response, or certificate failure does not restart the VPN. A
+Deeper egress checks run every five minutes by default. They rotate through the HTTPS
+IP-reporting pool in [src/config.js](src/config.js) and try up to three endpoints per
+check. A single website's rate limit, invalid response, or certificate failure does
+not restart the VPN. A
 confirmed return to the baseline IP requests a reconnect. Repeated transport failures
 across the fallback endpoints also request recovery. Manual `deep-healthcheck` performs
 fresh direct, HTTP-proxy, and SOCKS-proxy egress checks and may take up to about 27
@@ -89,8 +137,9 @@ seconds when fallback endpoints time out.
 Each proxy is supervised separately. A dead process is replaced at the next supervision
 cycle; a hung process must fail three probes before replacement. Restarting HTTP does
 not stop SOCKS, and restarting SOCKS does not stop HTTP. Proxy cleanup is bounded and
-port reuse waits for the old process to exit. Tinyproxy allows 1,024 clients and has a
-60-second inactivity timeout; this is an idle timeout, not a total request deadline.
+port reuse waits for the old process to exit. Tinyproxy's client capacity and idle
+timeout are configured in [docker/tinyproxy.conf](docker/tinyproxy.conf); the idle
+timeout is not a total request deadline.
 
 Both proxy binaries are built from pinned upstream source with a connection-establishment
 fix in [docker/proxy-connect-recovery.patch](docker/proxy-connect-recovery.patch).
@@ -99,14 +148,14 @@ or a fresh socket. It makes up to two passes through the addresses within a 7.5-
 TCP connection budget. DNS resolution precedes that budget. This repairs connections
 whose SYN packets receive no reply even while other connections to the same host work.
 Retries happen before application data is sent; established streams are not replayed.
-Tinyproxy retains its separate 60-second inactivity timeout after connecting.
+Tinyproxy retains its separately configured inactivity timeout after connecting.
 
 OpenConnect uses a five-second dead-peer detection interval to repair transport
 interruptions using its existing session. Once a tunnel interface appears, the first
 keepalive reply has a 15-second budget, independent of the longer SSO deadline.
 Failed browser authentication reports a session-specific status to the supervisor
-so it can retry promptly. When the
-watchdog requests a new session, it sends SIGTERM and allows five seconds for exit
+so it can retry promptly. When the watchdog requests a new session, it sends SIGTERM
+and allows five seconds for exit
 before SIGKILL. Remaining authentication descendants are terminated with the old
 process group. A forced OpenConnect termination exits the supervisor so Docker can
 restart a fresh network namespace. Normal child exit retries browser SSO after five
@@ -144,9 +193,12 @@ Compose drops all capabilities and adds `KILL`, `NET_ADMIN`, `NET_RAW`, `SETUID`
 
 ## Configuration
 
-Every supported environment variable is listed in the secret-free [.env.sample](.env.sample).
-Runtime variables are passed through Compose as bare names. Empty optional values
-use the defaults in [src/config.js](src/config.js).
+Operator settings are listed in the secret-free [.env.sample](.env.sample).
+[compose.yaml](compose.yaml) owns image selection, host bindings, and Docker health
+timings; [src/config.js](src/config.js) owns supervisor defaults and validation.
+Runtime variables are passed through Compose as bare names. Empty optional runtime
+values use the source defaults. Internal authentication-session and route-hook
+environment is supplied by the supervisor/OpenConnect, not by the operator.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
@@ -173,9 +225,15 @@ use the defaults in [src/config.js](src/config.js).
 | `VPN_HEALTHCHECK_RETRIES` | `8` | Docker's consecutive failure count. |
 | `VPN_HEALTHCHECK_START_PERIOD` | `90s` | Docker startup grace period. |
 
-The sample also documents browser-profile and runtime-state paths. Docker does not
-restart a container just because its health status becomes unhealthy; the supervisor
-performs recovery, and `restart: unless-stopped` handles supervisor exits.
+The sample also documents browser-profile and runtime-state paths. The baseline
+IP file's parent directory holds authentication status and split-exclusion state;
+the liveness file has its own configurable path. The browser profile and these
+state files live inside the container, with no persistent volume in the supplied
+Compose definition. Recreating the container discards that local runtime state.
+
+Docker does not restart a container just because its health status becomes
+unhealthy; the supervisor performs recovery, and `restart: unless-stopped` handles
+supervisor exits.
 
 The public-IP check assumes those endpoints use the VPN. Gateways that route all public
 Internet traffic directly need a VPN-routed verification endpoint. An IPv6-only setup
@@ -195,9 +253,31 @@ curl --fail --proxy socks5h://127.0.0.1:1080 https://api.ipify.org
 docker compose logs --since 10m vpn
 ```
 
-The self-test validates credential presence and TOTP generation without printing
-secrets. The routine healthcheck checks fresh readiness plus proxy protocols; the deep
-check verifies current application egress. `/app/vpn.js probe` repeats routine checks.
+The self-test validates credential presence, TOTP generation, exact static resolver
+configuration, and an IP-reporting request without printing credentials. It needs
+network access and does not perform a fresh browser login. The routine healthcheck
+checks fresh readiness plus proxy protocols; the deep check verifies current
+application egress. A passed healthcheck cannot establish every site's availability.
+
+### Container command reference
+
+Run these as `docker compose exec -T vpn /app/vpn.js COMMAND` unless noted otherwise.
+
+| Command | Effect and intended use |
+| --- | --- |
+| `healthcheck` | One local readiness/protocol check; used by Docker. No public website request. |
+| `deep-healthcheck` | Local readiness plus fresh direct, HTTP, and SOCKS egress comparisons. |
+| `self-test` | Credential/TOTP, resolver, and public-IP request checks; does not prove SSO. |
+| `probe` | Repeats the routine check and logs results until interrupted. |
+| `connect` | Container entrypoint: owns DNS, firewall, OpenConnect, proxies, and recovery. Do not start a second supervisor in a running stack. |
+| `configure-dns` | Internal route-hook operation that rewrites the container resolver. |
+| `configure-kill-switch` | Internal route-hook operation that refreshes proxy UID policy using hook environment and installed routes. |
+| An SSO URL | Internal OpenConnect external-browser callback; launches authentication for that session. |
+
+The last four forms are lifecycle integration points, not host-side diagnostic
+commands. Their implementation is mapped in [src/AGENTS.md](src/AGENTS.md).
+
+### Live recovery validation
 
 [test/live-recovery.cjs](test/live-recovery.cjs) is an **opt-in disruptive local test**.
 It can kill or stop proxy/OpenConnect processes and interrupt tunnel traffic. Its
@@ -210,32 +290,96 @@ your local setup; `--minutes` controls the soak length. Browser verification req
 an installed `agent-browser` and Chrome. The session and browser config are required
 to keep the test isolated from other browser work. This script is excluded from ordinary `npm test`.
 
+Use [test/AGENTS.md](test/AGENTS.md) for a complete invocation, phase selection,
+fixture assumptions, and cleanup. Some live phases assume the supplied ports,
+interfaces, image user IDs, and a gateway-specific split prefix; inspect these
+assumptions before using the harness against another deployment. Keep evidence
+outside the repository and retain full logs when an assertion fails.
+
 Inspect `watchdog.liveness.failed`, `watchdog.reconnect.triggered`,
 `public_ip.endpoint.failed`, and per-proxy restart events to distinguish tunnel loss,
 provider failures, and proxy failures. Authentication logs redact credential values and
 SSO material. Keep raw operational logs private.
 
-## Source layout and image maintenance
+### Diagnose by symptom
 
-- `src/vpn.js`: lifecycle, independent watchdog, and CLI dispatch.
-- `src/authentication.js`: browser state machine, TOTP, and authentication redaction.
-- `src/network.js`: DNS, atomic firewall policy, pushed exclusions, and IP verification.
-- `src/keepalive.js`: rotating tunnel-bound ICMP and atomic health state.
-- `src/proxies.js`: protocol probes and independent process supervision.
-- `src/runtime.js`: logging and bounded subprocess utilities.
-- `src/config.js` and `src/state.js`: configuration and supervisor-owned state.
+Begin with `docker compose ps`, recent service logs, and the routine healthcheck.
+Readiness, VPN transport, proxy protocols, and remote websites are separate layers.
 
-The Dockerfile pins OpenConnect commit `70d1e79d1e55849dfc71dcc199b1edb535b547e4`,
-MicroSocks `98421a21c4adc4c77c0cf3a5d650cc28ad3e0107` (v1.0.5),
-Tinyproxy `baecbf4c3e006fa68ab92f65bbd4138c47ede111` (1.11.3),
-Playwright `1.62.0`, and agent-browser `0.34.0`. The proxy source diff is applied during
-compilation; the resulting binaries replace the distribution binaries. Distribution
-packages still supply Tinyproxy's service account and static error/statistics pages.
-Keep the Playwright dependency, lockfile,
-and image tag aligned. Before publishing, build the image and verify fresh SSO,
-Chrome through both proxies, child and container recovery, firewall behavior, and
-sustained traffic. The existing GitHub workflow publishes the image on repository
-pushes to `main`; local commits and PR branch pushes do not publish it.
+| Symptom | Inspect | Next useful check |
+| --- | --- | --- |
+| Startup never reaches authentication | `baseline.retry`, resolver setup, reporting endpoints, outbound access. | Container `self-test`; confirm the selected verification endpoint is reachable before VPN connection. |
+| Repeated browser authentication failures | Redacted `browser.*` events, credentials, host clock, supported MFA forms. | Verify current identity-provider requirements and the handlers in `src/authentication.js`. |
+| Tunnel repeatedly reconnects | `watchdog.liveness.failed`, interface state, keepalive reachability, startup grace. | Check whether all configured targets are reachable through the tunnel; one blocked target alone should be tolerated. |
+| One proxy fails while the other works | Its local protocol probe, `check.failed`/`restart` events, egress result. | Test HTTP and SOCKS separately and distinguish local listener failure from destination connection failure. |
+| Routine health is good but web requests fail | Fresh egress via `deep-healthcheck`, DNS, requested site's reachability. | Compare another site and both protocols; the routine probe only exercises local proxy protocol responses. |
+| Public-IP verification fails intermittently | `public_ip.endpoint.failed` and whether errors are inconclusive or transport failures. | Inspect the configured pool/override and fallback behavior before attributing the failure to the tunnel. |
+| Egress equals the pre-VPN baseline | Endpoint route, installed pushed exclusions, expected gateway routing policy. | Use a VPN-routed verification endpoint; do not disable the equality check to make readiness pass. |
+| A split-excluded application cannot connect | Gateway-pushed prefixes, installed routes, proxy UID rules. | Follow `network.js` and the [route-hook guide](docker/AGENTS.md); unrelated direct routes do not authorize bypass. |
+| A rebuild seems to have no effect | Selected Compose image/pull policy and running container image ID. | Recreate from the intended local tag or published digest; editing source does not replace a running image. |
+| Docker reports unhealthy without restarting | Supervisor logs, liveness file freshness, process state. | Diagnose the supervisor; Docker health status itself does not trigger its restart policy. |
+
+Inspect routing/firewall state only in the intended container:
+
+```bash
+docker compose exec -T vpn ip -4 route show
+docker compose exec -T vpn ip -6 route show
+docker compose exec -T vpn iptables -S VPN_PROXY_KILLSWITCH
+docker compose exec -T vpn ip6tables -S VPN_PROXY_KILLSWITCH
+```
+
+IPv6 rules exist only when the container has IPv6 enabled. These outputs can reveal
+private topology; preserve them locally and redact before sharing. Avoid flushing
+rules or rewriting host routes as a proxy diagnostic step.
+
+## Repository map
+
+| Location | Read it for |
+| --- | --- |
+| [AGENTS.md](AGENTS.md) | Root file map, contributor procedure, validation matrix, artifact handling. |
+| [src/AGENTS.md](src/AGENTS.md) | Every source module, lifecycle/concurrency, state files, recovery invariants, change ownership. |
+| [docker/AGENTS.md](docker/AGENTS.md) | Proxy compilation, Tinyproxy health/configuration coupling, route-hook ordering, container validation. |
+| [test/AGENTS.md](test/AGENTS.md) | Regression fixtures, live phase selection, dedicated browser sessions, evidence and fault cleanup. |
+| [.github/AGENTS.md](.github/AGENTS.md) | PR and automation boundaries, release verification. |
+| [.github/workflows/AGENTS.md](.github/workflows/AGENTS.md) | Build/publish trigger, registry permissions, workflow validation and failure diagnosis. |
+
+Exact dependency pins live in [Dockerfile](Dockerfile) and
+[package-lock.json](package-lock.json); runtime defaults and endpoint pools live in
+[src/config.js](src/config.js). Folder guides describe their relationships so that
+routine dependency or configuration changes do not require updating copied versions
+and inventories throughout the documentation.
+
+## Image maintenance and release
+
+The Dockerfile builds OpenConnect and both proxies from pinned upstream revisions.
+The proxy source diff is applied during compilation; the resulting binaries replace
+the distribution binaries. Distribution packages still supply service accounts and
+Tinyproxy's static error/statistics pages. Keep the Playwright dependency, lockfile,
+and base-image tag aligned. See [docker/AGENTS.md](docker/AGENTS.md) before updating
+proxy pins or rebasing the diff.
+
+For runtime changes, build and verify fresh SSO, Chrome through both proxies, the
+affected recovery/firewall behavior, and sustained traffic. Publication and tests
+are separate: the [workflow](.github/workflows/publish-image.yml) builds and publishes
+on every push to `main`, including documentation merges, but does not run VPN tests
+or deploy a stack. PR branch pushes do not publish. Inspect the Actions result and
+record the image digest for the intended revision.
+
+For a stack using the published image, record its current image ID/digest before
+updating, then run:
+
+```bash
+docker compose pull vpn
+docker compose up -d --wait --wait-timeout 240
+docker compose exec -T vpn /app/vpn.js deep-healthcheck
+```
+
+Complete acceptance with a real page through each proxy. A recreated container
+starts with a fresh browser profile, runs SSO again, and interrupts existing proxy
+connections. Keep a known-good image digest if you need reproducible rollback:
+set `VPN_IMAGE` in the private `.env` to that full `ghcr.io/...@sha256:...` reference,
+then pull/recreate and repeat acceptance. A mutable `latest` tag cannot identify a
+previous release. Locally built stacks use the local-build instructions instead.
 
 ## Authentication compatibility and private files
 
@@ -245,10 +389,17 @@ SMS retrieval, passkeys, CAPTCHA, device-compliance enrollment, or arbitrary IdP
 The container's browser profile is separate from the host profile and persists across
 restarts of the same container. Recreating the container starts with a fresh profile.
 
-`.env`, `tmp/`, and `trash/` are excluded from Git and the build context. Old transcripts,
-research checkouts, and test evidence can be archived under timestamped `trash/`
-directories. Credentials stay in the private `.env`; Docker administrators can inspect
-the runtime environment, so access to Docker and backups also controls those secrets.
+`.env`, `tmp/`, and `trash/` are excluded from Git and the build context. On this
+workstation, temporary evidence belongs under
+`~/trash/anyconnect-browser-auth/tmp/<UTC_timestamp>_<snake_case_task>/`; preserve
+obsolete checkouts, transcripts, and backups under
+`~/trash/anyconnect-browser-auth/trash/<UTC_timestamp>_<snake_case_task>/`.
+Move and verify contents instead of deleting them. The regression suite still writes
+relative artifact directories; [test/AGENTS.md](test/AGENTS.md) shows how to run it
+from an external working directory.
+
+Credentials stay in the private `.env`; Docker administrators can inspect the
+runtime environment, so access to Docker and backups also controls those secrets.
 
 Use `docker compose stop` to stop the local service while retaining its container.
 
