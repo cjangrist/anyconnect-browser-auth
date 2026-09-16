@@ -26,7 +26,7 @@ content.
 | File | Authority and relationship |
 | --- | --- |
 | [Dockerfile](Dockerfile) | Build stages, upstream revision pins, installed tools, runtime paths, container entrypoint. Builds OpenConnect and the patched proxies, then copies source into `/app`. |
-| [compose.yaml](compose.yaml) | Service/image selection, restart policy, capabilities, TUN access, host port binding, environment passthrough, healthcheck, and log rotation. |
+| [compose.yaml](compose.yaml) | VPN and scoped image-updater services, image selection, restart policy, Docker socket binding, capabilities, TUN access, host ports, environment passthrough, healthcheck, and log rotation. |
 | [.env.sample](.env.sample) | Secret-free operator configuration template. Private `.env` supplies local credentials and overrides; it is not committed. |
 | [package.json](package.json) | Node package metadata, direct dependency requirements, and ordinary test command. |
 | [package-lock.json](package-lock.json) | Exact npm dependency resolution used by `npm ci`; keep Playwright aligned with the Docker base image. |
@@ -51,6 +51,10 @@ deeper checks compare direct and proxy egress with the pre-VPN baseline.
 
 Recovery belongs to the supervisor and OpenConnect. Docker's restart policy handles
 supervisor exits; Docker does not restart merely because health becomes unhealthy.
+The Compose updater polls the selected VPN image and recreates it after publication.
+Its enable-label and Compose-project scope must both match; keep unrelated stacks and
+the updater itself excluded. Docker must already start at boot. Image polling does
+not pull Git changes or apply edits to Compose; operators still apply those with `up`.
 The firewall applies to proxy UIDs inside the container and honors validated
 gateway split exclusions. It is not a host-wide firewall or a blanket ban on all
 non-tunnel container traffic. Existing TCP streams require client retry after a
@@ -70,14 +74,15 @@ tunnel or proxy loss; compiled proxy retries cover connection establishment only
 4. Run applicable checks below and inspect the full diff. Document what the checks
    establish and any environment-specific assumptions in the PR.
 5. After an authorized merge, verify the merge and its image-publication run.
-   Publication changes `latest`; consumers still need an explicit update/recreation
-   to run it. Do not equate publication with deployment.
+   Publication changes `latest`; verify that the scoped updater recreates the VPN
+   and restores health. Do not equate publication with deployment.
 
 ## Validation by change
 
 | Changed area | Required evidence |
 | --- | --- |
 | Documentation | Relative links/anchors and file references resolve; examples agree with source; rendered pages are readable; regression suite remains green. |
+| Compose lifecycle or updater | Quiet config validation, correct project/label selection, real image replacement, preserved ports/environment/restart policy, crash recovery, and Chrome through both proxies afterward. |
 | Node source or configuration | Regression tests, JavaScript syntax, Compose validation, rebuilt local image, relevant container health and real behavior. |
 | Browser authentication | Fresh SSO against the intended gateway plus browser-form regression cases; preserve private authentication evidence. |
 | Keepalive, lifecycle, or proxy supervision | Live phases for the affected failures, recovery through both proxies, and Chrome proof after faults. |

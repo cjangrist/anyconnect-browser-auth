@@ -3,7 +3,10 @@ services:
     image: ${VPN_IMAGE:-ghcr.io/cjangrist/anyconnect-browser-auth:latest}
     pull_policy: ${VPN_PULL_POLICY:-always}
     build: .
-    restart: unless-stopped
+    restart: always
+    labels:
+      com.centurylinklabs.watchtower.enable: ${VPN_AUTO_UPDATE_ENABLED:-true}
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME}
     cap_drop:
       - ALL
     cap_add:
@@ -68,3 +71,29 @@ services:
       timeout: ${VPN_HEALTHCHECK_TIMEOUT:-10s}
       retries: ${VPN_HEALTHCHECK_RETRIES:-8}
       start_period: ${VPN_HEALTHCHECK_START_PERIOD:-90s}
+
+  updater:
+    image: nickfedor/watchtower:1.22.2@sha256:b9c29d2cc30d5f232ab4d8d86e1a99749399c517cd12090dd3a7d2b6d03c90d5
+    restart: always
+    command:
+      - --label-enable
+      - --scope=${COMPOSE_PROJECT_NAME}
+      - --interval=60
+      - --update-on-start
+      - --include-restarting
+      - --rolling-restart
+      - --stop-timeout=30s
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - type: bind
+        source: ${VPN_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
